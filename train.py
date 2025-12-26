@@ -124,18 +124,16 @@ if __name__ == "__main__":
         accelerator="gpu",
         devices=2,  # 使用两块GPU
         strategy="ddp",  # DataDistributedParallel 策略
-        # precision="16-mixed",  # 使用混合精度训练，节省显存
         
         # 回调函数
         callbacks=[
             # 模型检查点
             L.pytorch.callbacks.ModelCheckpoint(
-                dirpath="checkpoints/swin_unet",
+                dirpath="checkpoints",
                 filename="swin-unet-{epoch:02d}-{train_loss:.4f}",
                 monitor="train_loss",  # 改为监控训练损失
                 mode="min",
                 save_top_k=3,
-                save_last=True
             ),
             # 学习率监控
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
