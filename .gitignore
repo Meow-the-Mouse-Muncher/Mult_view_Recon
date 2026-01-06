@@ -3,3 +3,5 @@ data/*
 lightning_logs/*
 models/__pycache__/*
 checkpoints/*
+logs/*
+dataset/__pycache__/*

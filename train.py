@@ -4,6 +4,8 @@ import lightning as L
 from torch import nn
 from models.recon_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
 from dataset.lightning_dataset import RefocusDataModule
+from lightning.pytorch.loggers import TensorBoardLogger
+from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 class ReconLightningModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 Swin-UNet。"""
@@ -25,44 +27,66 @@ class ReconLightningModule(L.LightningModule):
         
         # 保存超参数
         self.save_hyperparameters()
+        self.psnr = PeakSignalNoiseRatio()
+        self.ssim = StructuralSimilarityIndexMeasure()
 
     def forward(self, occ):
         return self.model(occ)  # 输入多视角数据，输出重建的 RGB 图像
 
     def training_step(self, batch, batch_idx):
         """训练步骤"""
-        gt, occ = batch  # GT: [B, 3, H, W], occ: [B, 96, H, W]
+        gt, occ, view= batch  # GT: [B, 3, H, W], occ: [B, 96, H, W]
         pred = self(occ)  # 前向传播: [B, 96, H, W] -> [B, 3, H, W]
         loss = self.criterion(pred, gt)  # 计算重建损失
         
         # 记录损失
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        
-        # 可选：记录学习率
-        self.log('lr', self.optimizers().param_groups[0]['lr'], on_step=True)
-        
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)     
         return loss
 
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
-        gt, occ = batch
+        gt, occ, view= batch
         pred = self(occ)
         loss = self.criterion(pred, gt)
+        # 计算指标
+        psnr_val = self.psnr(pred, gt)
+        ssim_val = self.ssim(pred, gt)
         
         # 记录验证损失
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
+        self.log('val_psnr', psnr_val, on_epoch=True, prog_bar=True)
+        self.log('val_ssim', ssim_val, on_epoch=True, prog_bar=True)
+        # 每个验证epoch记录第一个batch的图像
+        if batch_idx == 0:
+            # 取第一张图像
+            view_img = view[0]  # [3, H, W]
+            pred_img = pred[0]  # [3, H, W]
+            gt_img = gt[0]      # [3, H, W]
+            
+            # 拼接图像：左中右 = view, pred, GT
+            combined = torch.cat([view_img, pred_img, gt_img], dim=2)  # [3, H, 3*W]
+            
+            # 记录到 TensorBoard
+            self.logger.experiment.add_image(
+                'val_images/view_pred_gt', 
+                combined, 
+                self.current_epoch
+            )
         return loss
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
-        gt, occ = batch
+        gt, occ, view= batch
         pred = self(occ)
         loss = self.criterion(pred, gt)
+        # 计算指标
+        psnr_val = self.psnr(pred, gt)
+        ssim_val = self.ssim(pred, gt)
         
         # 记录测试损失
-        self.log('test_loss', loss, on_step=False, on_epoch=True)
-        
+        self.log('test_loss', loss,on_epoch=True, prog_bar=True)
+        self.log('test_psnr', psnr_val, on_epoch=True, prog_bar=True)
+        self.log('test_ssim', ssim_val, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -97,6 +121,7 @@ if __name__ == "__main__":
     
     # 方案1: 使用便捷函数创建模型（推荐）
     model = ReconLightningModule(model_size='tiny')  # 可选: 'tiny', 'small', 'base'
+    mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     
     # 方案2: 使用自定义配置
     # custom_config = ModelConfig(
@@ -114,26 +139,27 @@ if __name__ == "__main__":
     # 创建数据模块
     dm = RefocusDataModule(
         data_dir="data", 
-        batch_size=4,  # Swin-UNet 显存占用较大，减小 batch size
-        num_workers=4
+        model=mode,
+        batch_size=12,  # Swin-UNet 显存占用较大，减小 batch size
+        num_workers=16
     )
 
     # 创建 Trainer
     trainer = L.Trainer(
         max_epochs=200,
         accelerator="gpu",
-        devices=2,  # 使用两块GPU
+        devices=2,  
         strategy="ddp",  # DataDistributedParallel 策略
-        
+        logger=TensorBoardLogger("logs", name=mode,version=None), 
         # 回调函数
         callbacks=[
             # 模型检查点
             L.pytorch.callbacks.ModelCheckpoint(
-                dirpath="checkpoints",
+                dirpath=os.path.join("checkpoints", mode),
                 filename="swin-unet-{epoch:02d}-{train_loss:.4f}",
                 monitor="train_loss",  # 改为监控训练损失
                 mode="min",
-                save_top_k=3,
+                save_top_k=4,
             ),
             # 学习率监控
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
@@ -141,7 +167,8 @@ if __name__ == "__main__":
         
         # 日志设置
         log_every_n_steps=10,
-        
+        # 验证集间隔
+        check_val_every_n_epoch=10,
         # 梯度裁剪（对 Transformer 有帮助）
         gradient_clip_val=1.0,
         
@@ -157,6 +184,6 @@ if __name__ == "__main__":
     trainer.fit(model, dm)
     
     # 可选：测试最佳模型
-    # trainer.test(model, dm, ckpt_path="best")
+    trainer.test(model, dm, ckpt_path="best")
     
     print("=== 训练完成 ===")
