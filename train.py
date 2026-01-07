@@ -9,7 +9,7 @@ from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 class ReconLightningModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 Swin-UNet。"""
-    def __init__(self, model_config: ModelConfig = None, model_size: str = 'tiny'):
+    def __init__(self, model_config: ModelConfig = None, model_size: str = 'small'):
         super().__init__()
         
         # 如果没有提供配置，使用预定义配置
@@ -40,7 +40,7 @@ class ReconLightningModule(L.LightningModule):
         loss = self.criterion(pred, gt)  # 计算重建损失
         
         # 记录损失
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)     
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)     
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -53,9 +53,9 @@ class ReconLightningModule(L.LightningModule):
         ssim_val = self.ssim(pred, gt)
         
         # 记录验证损失
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
-        self.log('val_psnr', psnr_val, on_epoch=True, prog_bar=True)
-        self.log('val_ssim', ssim_val, on_epoch=True, prog_bar=True)
+        self.log('val/loss', loss, on_epoch=True, prog_bar=True)
+        self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True)
+        self.log('val/ssim', ssim_val, on_epoch=True, prog_bar=True)
         # 每个验证epoch记录第一个batch的图像
         if batch_idx == 0:
             # 取第一张图像
@@ -84,9 +84,9 @@ class ReconLightningModule(L.LightningModule):
         ssim_val = self.ssim(pred, gt)
         
         # 记录测试损失
-        self.log('test_loss', loss,on_epoch=True, prog_bar=True)
-        self.log('test_psnr', psnr_val, on_epoch=True, prog_bar=True)
-        self.log('test_ssim', ssim_val, on_epoch=True, prog_bar=True)
+        self.log('test/loss', loss,on_epoch=True, prog_bar=True)
+        self.log('test/psnr', psnr_val, on_epoch=True, prog_bar=True)
+        self.log('test/ssim', ssim_val, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     print("=== 开始训练 Swin-UNet 模型 ===")
     
     # 方案1: 使用便捷函数创建模型（推荐）
-    model = ReconLightningModule(model_size='tiny')  # 可选: 'tiny', 'small', 'base'
+    model = ReconLightningModule(model_size='small')  # 可选: 'tiny', 'small', 'base'
     mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     
     # 方案2: 使用自定义配置
@@ -140,16 +140,16 @@ if __name__ == "__main__":
     dm = RefocusDataModule(
         data_dir="data", 
         model=mode,
-        batch_size=12,  # Swin-UNet 显存占用较大，减小 batch size
-        num_workers=16
+        batch_size=8,  # Swin-UNet 显存占用较大，减小 batch size
+        num_workers=8
     )
 
     # 创建 Trainer
     trainer = L.Trainer(
-        max_epochs=200,
+        max_epochs=600,
         accelerator="gpu",
-        devices=2,  
-        strategy="ddp",  # DataDistributedParallel 策略
+        devices=[0],  
+        strategy="auto",  # DataDistributedParallel 策略
         logger=TensorBoardLogger("logs", name=mode,version=None), 
         # 回调函数
         callbacks=[
@@ -170,7 +170,7 @@ if __name__ == "__main__":
         # 验证集间隔
         check_val_every_n_epoch=10,
         # 梯度裁剪（对 Transformer 有帮助）
-        gradient_clip_val=1.0,
+        # gradient_clip_val=1.0,
         
         # 累积梯度（如果显存不够）
         # accumulate_grad_batches=2,

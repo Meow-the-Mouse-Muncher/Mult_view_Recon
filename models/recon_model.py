@@ -165,7 +165,7 @@ class SwinUNetConfigs:
         )
 
 # 便捷的模型创建函数
-def create_swin_unet(model_size='tiny', in_chans=96, out_chans=3, img_size=512):
+def create_swin_unet(model_size='small', in_chans=96, out_chans=3, img_size=512):
     """
     创建 Swin-UNet 模型
     
