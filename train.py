@@ -2,6 +2,7 @@ import os
 import torch
 import lightning as L
 from torch import nn
+import lpips  # 感知损失库
 from models.recon_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
 from dataset.lightning_dataset import RefocusDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -23,7 +24,13 @@ class ReconLightningModule(L.LightningModule):
         else:
             self.model = PyramidUNet(model_config)
             
-        self.criterion = nn.MSELoss()  # 图像重建任务使用 MSE 损失
+        # 损失函数
+        self.mse_loss = nn.MSELoss()
+        self.perceptual_loss = lpips.LPIPS(net='vgg')  # 使用 AlexNet 作为感知损失
+        
+        # 损失权重
+        self.mse_weight = 1.0
+        self.perceptual_weight = 0.1
         
         # 保存超参数
         self.save_hyperparameters()
@@ -35,27 +42,48 @@ class ReconLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """训练步骤"""
-        gt, occ, view= batch  # GT: [B, 3, H, W], occ: [B, 96, H, W]
+        gt, occ, view = batch  # GT: [B, 3, H, W], occ: [B, 96, H, W]
         pred = self(occ)  # 前向传播: [B, 96, H, W] -> [B, 3, H, W]
-        loss = self.criterion(pred, gt)  # 计算重建损失
+        
+        # 计算 MSE 损失
+        mse_loss = self.mse_loss(pred, gt)
+        
+        # 计算感知损失 (LPIPS 期望输入范围 [-1, 1])
+        pred_norm = pred * 2 - 1  # [0, 1] -> [-1, 1]
+        gt_norm = gt * 2 - 1      # [0, 1] -> [-1, 1]
+        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
+        
+        # 总损失
+        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
         
         # 记录损失
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)     
-        return loss
+        self.log('train/total_loss', total_loss, on_step=True, prog_bar=True)
+        self.log('train/mse_loss', mse_loss, on_step=True)
+        self.log('train/perceptual_loss', perceptual_loss, on_step=True)
+        
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
-        gt, occ, view= batch
+        gt, occ, view = batch
         pred = self(occ)
-        loss = self.criterion(pred, gt)
+        
+        # 计算损失
+        mse_loss = self.mse_loss(pred, gt)
+        pred_norm = pred * 2 - 1
+        gt_norm = gt * 2 - 1
+        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
+        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
+        
         # 计算指标
         psnr_val = self.psnr(pred, gt)
         ssim_val = self.ssim(pred, gt)
         
-        # 记录验证损失
-        self.log('val/loss', loss, on_epoch=True, prog_bar=True)
-        self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True)
-        self.log('val/ssim', ssim_val, on_epoch=True, prog_bar=True)
+        # 记录验证损失 - 明确指定只在 epoch 级别记录
+        self.log('val/total_loss', total_loss, on_step=True, prog_bar=True)
+        self.log('val/psnr', psnr_val, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/ssim', ssim_val, on_step=False, on_epoch=True, prog_bar=True)
+        
         # 每个验证epoch记录第一个batch的图像
         if batch_idx == 0:
             # 取第一张图像
@@ -72,22 +100,31 @@ class ReconLightningModule(L.LightningModule):
                 combined, 
                 self.current_epoch
             )
-        return loss
+        return total_loss
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
-        gt, occ, view= batch
+        gt, occ, view = batch
         pred = self(occ)
-        loss = self.criterion(pred, gt)
+        
+        # 计算损失
+        mse_loss = self.mse_loss(pred, gt)
+        pred_norm = pred * 2 - 1
+        gt_norm = gt * 2 - 1
+        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
+        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
+        
         # 计算指标
         psnr_val = self.psnr(pred, gt)
         ssim_val = self.ssim(pred, gt)
         
-        # 记录测试损失
-        self.log('test/loss', loss,on_epoch=True, prog_bar=True)
-        self.log('test/psnr', psnr_val, on_epoch=True, prog_bar=True)
-        self.log('test/ssim', ssim_val, on_epoch=True, prog_bar=True)
-        return loss
+        # 记录测试损失 - 明确指定只在 epoch 级别记录
+        self.log('test/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test/mse_loss', mse_loss, on_step=False, on_epoch=True)
+        self.log('test/perceptual_loss', perceptual_loss, on_step=False, on_epoch=True)
+        self.log('test/psnr', psnr_val, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test/ssim', ssim_val, on_step=False, on_epoch=True, prog_bar=True)
+        return total_loss
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -110,37 +147,24 @@ class ReconLightningModule(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "train_loss",  # 改为监控训练损失
+                "monitor": "train/total_loss",  # 监控总损失
                 "interval": "epoch",
                 "frequency": 1,
             },
         }
 
 if __name__ == "__main__":
-    print("=== 开始训练 Swin-UNet 模型 ===")
+    print("=== 开始训练 Swin-UNet 模型 (MSE + 感知损失) ===")
     
     # 方案1: 使用便捷函数创建模型（推荐）
     model = ReconLightningModule(model_size='small')  # 可选: 'tiny', 'small', 'base'
     mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     
-    # 方案2: 使用自定义配置
-    # custom_config = ModelConfig(
-    #     in_chans=32*3,  # 32个视角 * 3通道
-    #     out_chans=3,    # RGB 输出
-    #     img_size=512,
-    #     embed_dim=96,
-    #     depths=[2, 2, 6, 2],  # Swin-Tiny 配置
-    #     num_heads=[3, 6, 12, 24],
-    #     window_size=8,  # 确保能被图像尺寸整除
-    #     drop_path_rate=0.1
-    # )
-    # model = ReconLightningModule(custom_config)
-
     # 创建数据模块
     dm = RefocusDataModule(
         data_dir="data", 
         model=mode,
-        batch_size=8,  # Swin-UNet 显存占用较大，减小 batch size
+        batch_size=6,  # Swin-UNet 显存占用较大，减小 batch size
         num_workers=8
     )
 
@@ -149,15 +173,15 @@ if __name__ == "__main__":
         max_epochs=600,
         accelerator="gpu",
         devices=[0],  
-        strategy="auto",  # DataDistributedParallel 策略
-        logger=TensorBoardLogger("logs", name=mode,version=None), 
+        strategy="auto",
+        logger=TensorBoardLogger("logs", name=mode, version=None), 
         # 回调函数
         callbacks=[
             # 模型检查点
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
-                filename="swin-unet-{epoch:02d}-{train_loss:.4f}",
-                monitor="train_loss",  # 改为监控训练损失
+                filename="swin-unet-{epoch:02d}-{train/total_loss:.4f}",
+                monitor="train/total_loss",  # 监控总损失
                 mode="min",
                 save_top_k=4,
             ),
@@ -171,9 +195,6 @@ if __name__ == "__main__":
         check_val_every_n_epoch=10,
         # 梯度裁剪（对 Transformer 有帮助）
         # gradient_clip_val=1.0,
-        
-        # 累积梯度（如果显存不够）
-        # accumulate_grad_batches=2,
     )
 
     # 打印模型信息

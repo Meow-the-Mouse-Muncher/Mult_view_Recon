@@ -15,14 +15,12 @@ class ModelConfig:
     patch_size: int = 4
     embed_dim: int = 96
     depths: list = None
-    depths_decoder: list = None
     num_heads: list = None
     window_size: int = 8  # 改为 8，512 可以被 8 整除
     mlp_ratio: float = 4.0
     qkv_bias: bool = True
     qk_scale: float = None
     drop_rate: float = 0.0
-    attn_drop_rate: float = 0.0
     drop_path_rate: float = 0.1
     ape: bool = False
     patch_norm: bool = True
@@ -31,8 +29,6 @@ class ModelConfig:
     def __post_init__(self):
         if self.depths is None:
             self.depths = [2, 2, 6, 2]  # Swin-T 配置
-        if self.depths_decoder is None:
-            self.depths_decoder = [2, 6, 2, 2]
         if self.num_heads is None:
             self.num_heads = [3, 6, 12, 24]  # Swin-T 配置
 
@@ -137,9 +133,8 @@ class SwinUNetConfigs:
         return ModelConfig(
             embed_dim=96,
             depths=[2, 2, 6, 2],
-            depths_decoder=[2, 6, 2, 2],
             num_heads=[3, 6, 12, 24],
-            window_size=8  # 512 可以被 8 整除
+            window_size=8
         )
     
     @staticmethod
@@ -148,9 +143,8 @@ class SwinUNetConfigs:
         return ModelConfig(
             embed_dim=96,
             depths=[2, 2, 18, 2],
-            depths_decoder=[2, 18, 2, 2],
             num_heads=[3, 6, 12, 24],
-            window_size=8  # 512 可以被 8 整除
+            window_size=8
         )
     
     @staticmethod
@@ -159,9 +153,8 @@ class SwinUNetConfigs:
         return ModelConfig(
             embed_dim=128,
             depths=[2, 2, 18, 2],
-            depths_decoder=[2, 18, 2, 2],
             num_heads=[4, 8, 16, 32],
-            window_size=8  # 512 可以被 8 整除
+            window_size=8
         )
 
 # 便捷的模型创建函数
