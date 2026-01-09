@@ -5,3 +5,4 @@ models/__pycache__/*
 checkpoints/*
 logs/*
 dataset/__pycache__/*
+sparse_data

@@ -58,8 +58,8 @@ class ReconLightningModule(L.LightningModule):
         
         # 记录损失
         self.log('train/total_loss', total_loss, on_step=True, prog_bar=True)
-        self.log('train/mse_loss', mse_loss, on_step=True)
-        self.log('train/perceptual_loss', perceptual_loss, on_step=True)
+        self.log('train/mse_loss', mse_loss, on_step=True, prog_bar=True)
+        self.log('train/perceptual_loss', perceptual_loss, on_step=True, prog_bar=True)
         
         return total_loss
 
@@ -79,8 +79,8 @@ class ReconLightningModule(L.LightningModule):
         psnr_val = self.psnr(pred, gt)
         ssim_val = self.ssim(pred, gt)
         
-        # 记录验证损失 - 明确指定只在 epoch 级别记录
-        self.log('val/total_loss', total_loss, on_step=True, prog_bar=True)
+        # 记录验证损失
+        self.log('val/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val/psnr', psnr_val, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val/ssim', ssim_val, on_step=False, on_epoch=True, prog_bar=True)
         
@@ -118,7 +118,7 @@ class ReconLightningModule(L.LightningModule):
         psnr_val = self.psnr(pred, gt)
         ssim_val = self.ssim(pred, gt)
         
-        # 记录测试损失 - 明确指定只在 epoch 级别记录
+        # 记录测试损失
         self.log('test/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('test/mse_loss', mse_loss, on_step=False, on_epoch=True)
         self.log('test/perceptual_loss', perceptual_loss, on_step=False, on_epoch=True)
@@ -139,7 +139,7 @@ class ReconLightningModule(L.LightningModule):
         # 使用余弦退火学习率调度器
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, 
-            T_max=200,  # 最大轮数
+            T_max=600,  # 最大轮数
             eta_min=1e-6  # 最小学习率
         )
         
@@ -147,7 +147,6 @@ class ReconLightningModule(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "train/total_loss",  # 监控总损失
                 "interval": "epoch",
                 "frequency": 1,
             },
@@ -162,7 +161,7 @@ if __name__ == "__main__":
     
     # 创建数据模块
     dm = RefocusDataModule(
-        data_dir="data", 
+        data_dir="sparse_data", 
         model=mode,
         batch_size=6,  # Swin-UNet 显存占用较大，减小 batch size
         num_workers=8
@@ -170,7 +169,7 @@ if __name__ == "__main__":
 
     # 创建 Trainer
     trainer = L.Trainer(
-        max_epochs=600,
+        max_epochs=2400,
         accelerator="gpu",
         devices=[0],  
         strategy="auto",
@@ -180,8 +179,8 @@ if __name__ == "__main__":
             # 模型检查点
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
-                filename="swin-unet-{epoch:02d}-{train/total_loss:.4f}",
-                monitor="train/total_loss",  # 监控总损失
+                filename="swin-unet-{epoch:02d}",
+                monitor="val/total_loss",  # 推荐监控验证损失
                 mode="min",
                 save_top_k=4,
             ),
@@ -190,9 +189,9 @@ if __name__ == "__main__":
         ],
         
         # 日志设置
-        log_every_n_steps=10,
+        log_every_n_steps=20,
         # 验证集间隔
-        check_val_every_n_epoch=10,
+        check_val_every_n_epoch=20,
         # 梯度裁剪（对 Transformer 有帮助）
         # gradient_clip_val=1.0,
     )
@@ -201,8 +200,19 @@ if __name__ == "__main__":
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    # 开始训练
-    trainer.fit(model, dm)
+    # --- 增加断点重训逻辑 ---
+    ckpt_dir = os.path.join("checkpoints", mode)
+    last_ckpt = None
+    if os.path.exists(ckpt_dir):
+        # 寻找目录下所有的 .ckpt 文件
+        ckpts = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')]
+        if ckpts:
+            # 找到最后修改的文件（通常是最近保存的）
+            last_ckpt = max(ckpts, key=os.path.getmtime)
+            print(f"检测到断点文件，将从此处恢复训练: {last_ckpt}")
+
+    # 开始训练 (传入 ckpt_path 参数)
+    trainer.fit(model, dm, ckpt_path=last_ckpt)
     
     # 可选：测试最佳模型
     trainer.test(model, dm, ckpt_path="best")

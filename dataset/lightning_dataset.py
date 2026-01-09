@@ -1,6 +1,7 @@
 import os
 import h5py
 import torch
+import random
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
 from typing import Optional
@@ -18,10 +19,24 @@ class RefocusDataset(Dataset):
     def __getitem__(self, idx):
         h5_file = self.h5_files[idx]
         with h5py.File(h5_file, 'r') as f:
-            # 修改为从文件读取并 squeeze(0) 去掉 batch 维度
             gt = torch.from_numpy(f['gt'][:]).float()/255      
             occ = torch.from_numpy(f['occ'][:]).float()/255
             occ_mid = torch.from_numpy(f['view'][:]).float()/255
+        
+        # 数据增强：随机翻转
+        if self.split == 'train':
+            # 随机水平翻转
+            if random.random() > 0.5:
+                gt = torch.flip(gt, dims=[2])      # [C, H, W] -> W 是 dim 2
+                occ = torch.flip(occ, dims=[2])
+                occ_mid = torch.flip(occ_mid, dims=[2])
+            
+            # 随机垂直翻转
+            if random.random() > 0.5:
+                gt = torch.flip(gt, dims=[1])      # [C, H, W] -> H 是 dim 1
+                occ = torch.flip(occ, dims=[1])
+                occ_mid = torch.flip(occ_mid, dims=[1])
+
         return gt, occ, occ_mid
 
 class RefocusDataModule(L.LightningDataModule):
@@ -64,7 +79,7 @@ class RefocusDataModule(L.LightningDataModule):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)

@@ -149,8 +149,8 @@ def create_h5_pairs(root: str, out_dir: str, overwrite: bool = False, downsample
 
 
 if __name__ == "__main__":
-    root_dir = "/home_ssd/sjy/UE5_Project/PCGBiomeForestPoplar/refocus_data"
-    out_dir = "data"
+    root_dir = "/home_ssd/sjy/UE5_Project/PCGBiomeForestPoplar/refocus_sparse_data"
+    out_dir = "sparse_data"
     os.makedirs(out_dir, exist_ok=True)
     downsample_factor = 2
     
