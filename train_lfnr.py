@@ -3,12 +3,12 @@ import torch
 import lightning as L
 from torch import nn
 import lpips  # 感知损失库
-from models.recon_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
+from models.LF_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
 from dataset.LF_dataset import RefocusDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-class ReconLightningModule(L.LightningModule):
+class LFModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 Swin-UNet。"""
     def __init__(self, model_config: ModelConfig = None, model_size: str = 'small'):
         super().__init__()
