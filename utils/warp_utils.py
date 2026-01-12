@@ -113,65 +113,88 @@ def precompute_transforms(poses: List[np.ndarray], center_pose: np.ndarray, K: n
     
     return shared_data, frame_transforms
 
-def refocus_image_gpu(src_img, src_depth, center_depth, frame_transform, shared_data, device='cuda'):
-    """GPU加速的逆向重聚焦图像处理"""
-    R_c2s, T_c2s = frame_transform
-    K, K_inv = shared_data
-    h, w = src_img.shape[:2]
-    
+def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device='cuda'):
+    """
+    GPU Batch Warping: 将一批 src_imgs 投影到 center_pose 的视角
+    如果输入是单张图 src_imgs [H, W, 3], src_poses [4, 4], 会自动升维处理
+    """
+    # 兼容单张图片输入 (处理之前已有的调用方式)
+    if src_imgs.ndim == 3:
+        src_imgs = src_imgs[None, ...] # [H, W, 3] -> [1, H, W, 3]
+        
+    # 兼容 src_poses 可能是 list 或者 (R, T) tuple
+    if isinstance(src_poses, tuple):
+        # 这种是以前的 frame_transform=(R_c2s, T_c2s) 模式，现在不再支持，需要调用方修改
+        raise ValueError("Deprecated tuple input for src_poses. Please pass full pose matrix.")
+    if isinstance(src_poses, list):
+        src_poses = np.array(src_poses)
+    if src_poses.ndim == 2:
+         src_poses = src_poses[None, ...] # [4, 4] -> [1, 4, 4]
+
+    if len(src_imgs) == 0:
+        return np.array([])
+        
+    N, H, W, _ = src_imgs.shape
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     
-    # Convert to tensors
-    src_tensor = torch.from_numpy(src_img).float().to(device)
-    depth_m = -torch.from_numpy(center_depth).float().to(device)  # m, negative for -Z
+    # 1. 移动数据到 GPU
+    src_tensor = torch.from_numpy(src_imgs).float().permute(0, 3, 1, 2).to(device) # [N, 3, H, W]
+    src_tensor /= 255.0
+    
     K_tensor = torch.from_numpy(K).float().to(device)
-    K_inv_tensor = torch.from_numpy(K_inv).float().to(device)
-    R_c2s_tensor = torch.from_numpy(R_c2s).float().to(device)
-    T_c2s_tensor = torch.from_numpy(T_c2s).float().to(device)
+    K_inv = torch.inverse(K_tensor)
     
-    # Create pixel coordinates for center camera
-    u, v = torch.meshgrid(torch.arange(w, device=device), torch.arange(h, device=device), indexing='xy')
-    ones = torch.ones_like(u)
-    pixels = torch.stack([u.flatten(), v.flatten(), ones.flatten()], dim=0).float()
+    center_R = torch.from_numpy(center_pose[:3, :3]).float().to(device)
+    center_T = torch.from_numpy(center_pose[:3, 3]).float().to(device)
     
-    # Unproject to rays in center camera coordinate system
-    rays_center = (K_inv_tensor @ pixels).reshape(3, h, w)  # [3, H, W]
+    src_poses_torch = torch.from_numpy(src_poses).float().to(device)
+    src_R = src_poses_torch[:, :3, :3] # [N, 3, 3]
+    src_T = src_poses_torch[:, :3, 3]  # [N, 3]
     
-    # Apply per-pixel depth and transform to source camera
-    # points_3d_center = rays_center * depth
-    points_3d_center = rays_center * depth_m.unsqueeze(0)
+    depth_m = -torch.from_numpy(center_depth).float().to(device) # [H, W]
     
-    # Transform to source camera: R_c2s @ points_3d_center + T_c2s
-    transformed_points = R_c2s_tensor @ points_3d_center.reshape(3, -1) + T_c2s_tensor
-    transformed_points = transformed_points.reshape(3, h, w)
+    # 2. 计算相对变换 R_c2s, T_c2s
+    # [N, 3, 3]
+    rel_R = torch.bmm(src_R.transpose(1, 2), center_R.unsqueeze(0).expand(N, -1, -1))
     
-    # Project to source camera image plane
-    projected = K_tensor @ transformed_points.reshape(3, -1)
-    projected = projected.reshape(3, h, w)
+    # [N, 3, 1]
+    diff_T = (center_T - src_T).unsqueeze(-1) # [N, 3, 1]
+    rel_T = torch.bmm(src_R.transpose(1, 2), diff_T) # [N, 3, 1]
     
-    # Perspective division
-    z = projected[2, :, :] + 1e-6
-    x_coords = projected[0, :, :] / z
-    y_coords = projected[1, :, :] / z
-     
-    # Use GPU grid sampling for remapping
-    # Normalize coordinates to [-1, 1] for grid_sample
-    x_norm = 2.0 * x_coords / (w - 1) - 1.0
-    y_norm = 2.0 * y_coords / (h - 1) - 1.0
+    # 3. 反向投影 Center Rays (一次计算)
+    u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
+    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float() # [H, W, 3]
+    pixels = pixels.reshape(-1, 3).T # [3, HW]
     
-    # Create sampling grid
-    grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)  # [1, H, W, 2]
-    src_tensor_norm = src_tensor.permute(2, 0, 1).unsqueeze(0) / 255.0  # [1, 3, H, W]
-    # Sample color and depth from source
-    sampled_color = torch.nn.functional.grid_sample(
-        src_tensor_norm, grid, 
-        mode='bilinear', 
-        padding_mode='zeros', 
-        align_corners=True
+    rays_camera = K_inv @ pixels # [3, HW]
+    points_3d = rays_camera * depth_m.reshape(1, -1) # [3, HW]
+    
+    # 4. Batch 变换
+    # [N, 3, 3] @ [1, 3, HW] -> [N, 3, HW]
+    points_src = torch.bmm(rel_R, points_3d.unsqueeze(0).expand(N, -1, -1)) + rel_T
+    
+    # 5. 投影回 Source 图像
+    # [1, 3, 3] @ [N, 3, HW] -> [N, 3, HW]
+    proj_src = torch.bmm(K_tensor.unsqueeze(0).expand(N, -1, -1), points_src)
+    
+    z = proj_src[:, 2:3, :] + 1e-6
+    uv_src = proj_src[:, :2, :] / z # [N, 2, HW]
+    
+    # 6. Grid Sample
+    # Normalize to [-1, 1]
+    uv_src[:, 0] = 2.0 * uv_src[:, 0] / (W - 1) - 1.0
+    uv_src[:, 1] = 2.0 * uv_src[:, 1] / (H - 1) - 1.0
+    
+    grid = uv_src.permute(0, 2, 1).reshape(N, H, W, 2)
+    
+    warped = torch.nn.functional.grid_sample(
+        src_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=True
     )
-    result = sampled_color.squeeze(0).permute(1, 2, 0) * 255.0  # [H, W, 3]
-    return result.cpu().numpy().astype(np.uint8)
-
+    
+    res = (warped.permute(0, 2, 3, 1) * 255.0).cpu().numpy().astype(np.uint8)
+    
+    # 如果原始输入是单张，则返回单张 (去掉 batch 维度)
+    return res[0] if res.shape[0] == 1 else res
 
 
 def recenter_poses(poses):
