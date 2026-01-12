@@ -68,10 +68,15 @@ class RefocusDataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         """设置数据集划分"""
         if stage == 'fit' or stage is None:
-            # 简单划分：前 80% 为 train，后 20% 为 val
-            train_size = int(0.8 * len(self.h5_files))
-            self.train_dataset = RefocusDataset(self.h5_files[:train_size], split='train')
-            self.val_dataset = RefocusDataset(self.h5_files[train_size:], split='val')
+            # 为了保证划分的随机性且可重复，先根据种子打乱列表
+            # 注意：这里使用局部 Random 实例以不影响全局随机状态
+            shuffled_files = self.h5_files.copy()
+            random.Random(42).shuffle(shuffled_files)
+            
+            # 划分：前 90% 为 train，后 10% 为 val
+            train_size = int(0.9 * len(shuffled_files))
+            self.train_dataset = RefocusDataset(shuffled_files[:train_size], split='train')
+            self.val_dataset = RefocusDataset(shuffled_files[train_size:], split='val')
         elif stage == 'test':
             self.test_dataset = RefocusDataset(self.h5_files, split='test')
 

@@ -49,18 +49,17 @@ class ReconLightningModule(L.LightningModule):
         mse_loss = self.mse_loss(pred, gt)
         
         # 计算感知损失 (LPIPS 期望输入范围 [-1, 1])
-        # pred_norm = pred * 2 - 1  # [0, 1] -> [-1, 1]
-        # gt_norm = gt * 2 - 1      # [0, 1] -> [-1, 1]
-        # perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
+        pred_norm = pred * 2 - 1  # [0, 1] -> [-1, 1]
+        gt_norm = gt * 2 - 1      # [0, 1] -> [-1, 1]
+        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
         
         # 总损失
-        total_loss = self.mse_weight * mse_loss 
-        # + self.perceptual_weight * perceptual_loss
+        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
         
         # 记录损失
         self.log('train/total_loss', total_loss, on_step=True, prog_bar=True)
         self.log('train/mse_loss', mse_loss, on_step=True, prog_bar=True)
-        # self.log('train/perceptual_loss', perceptual_loss, on_step=True, prog_bar=True)
+        self.log('train/perceptual_loss', perceptual_loss, on_step=True, prog_bar=True)
         
         return total_loss
 
@@ -158,7 +157,7 @@ if __name__ == "__main__":
     
     # 方案1: 使用便捷函数创建模型（推荐）
     model = ReconLightningModule(model_size='small')  # 可选: 'tiny', 'small', 'base'
-    mode = "fix_line" # mode =[fix_line,rot_arc,rot_line]
+    mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     
     # 创建数据模块
     dm = RefocusDataModule(
@@ -172,7 +171,7 @@ if __name__ == "__main__":
     trainer = L.Trainer(
         max_epochs=2400,
         accelerator="gpu",
-        devices=[1],  
+        devices=[0],  
         strategy="auto",
         logger=TensorBoardLogger("logs", name=mode, version=None), 
         # 回调函数
