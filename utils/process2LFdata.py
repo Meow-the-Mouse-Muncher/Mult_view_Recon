@@ -8,9 +8,7 @@ from utils.warp_utils import (
     precompute_transforms, 
     refocus_image_gpu
 )
-from utils.ray_utils import (
-    generate_rays, compute_pts3d
-)
+# 移除了 ray_utils 的引用，因为这里不再计算光线
 import numpy as np
 import cv2
 import h5py
@@ -56,6 +54,7 @@ def find_sequence_pairs(root_dir: str) -> List[Tuple[str, str, str]]:
 def process_to_h5(root_dir, save_dir):
     """
     将数据处理并保存为 HDF5
+    只保存图像、深度图和位姿，光线在训练时动态生成
     """
     os.makedirs(save_dir, exist_ok=True)
     pairs = find_sequence_pairs(root_dir)
@@ -74,28 +73,16 @@ def process_to_h5(root_dir, save_dir):
         K = data['K']
         h, w = data['gt_target']['image'].shape[:2]
         
-        gt_rgb = data['gt_target']['image'][None, ...]
-        gt_depth = data['gt_target']['depth']
-        gt_pose = data['gt_target']['pose']
+        gt_rgb = data['gt_target']['image']
+        gt_depth = data['gt_target']['depth'] # 保存 Depth，shape [H, W]
+        gt_pose = data['gt_target']['pose']   # 保存 Pose, shape [4, 4]
         
-        # GPU 计算光线和 3D 点
-        K_torch = torch.from_numpy(K).float().cuda()
-        gt_pose_torch = torch.from_numpy(gt_pose).float().cuda()
-        gt_depth_torch = torch.from_numpy(gt_depth).float().cuda()
-        
-        # [1, 4, 4]
-        gt_rays_o_torch, gt_rays_d_torch = generate_rays(h, w, K_torch, gt_pose_torch[None, ...])
-        gt_pts3d_torch = compute_pts3d(h, w, K_torch, gt_pose_torch, gt_depth_torch)
-        
-        # 转回 CPU 存 H5
-        gt_rays_o = gt_rays_o_torch.cpu().numpy()
-        gt_rays_d = gt_rays_d_torch.cpu().numpy()
-        gt_pts3d = gt_pts3d_torch.cpu().numpy()[None, ...]
+        # 不再生成 rays 和 pts3d
         
         ref_imgs = data['occ_ref']['images'] 
         ref_poses = data['occ_ref']['poses'] 
         
-        # GPU 批量 warp 图像
+        # GPU 批量 warp 图像 (Warping比较耗时，结果建议保留)
         if len(ref_imgs) > 0:
             occ_warped_rgb = refocus_image_gpu(
                 src_imgs=ref_imgs,
@@ -105,21 +92,12 @@ def process_to_h5(root_dir, save_dir):
                 K=K,
                 device='cuda'
             )
-            
-            # GPU 计算 Ref Rays
-            ref_poses_torch = torch.from_numpy(ref_poses).float().cuda()
-            ref_rays_o_torch, ref_rays_d_torch = generate_rays(h, w, K_torch, ref_poses_torch)
-            ref_rays_o = ref_rays_o_torch.cpu().numpy()
-            ref_rays_d = ref_rays_d_torch.cpu().numpy()
-            
         else:
             occ_warped_rgb = np.array([])
-            ref_rays_o = np.array([])
-            ref_rays_d = np.array([])
 
-        occ_target_img = data['occ_target']['image'][None, ...]
+        occ_target_img = data['occ_target']['image']
 
-        # 4. 保存到 H5，确保子文件夹存在
+        # 4. 保存到 H5
         h5_path = os.path.join(save_dir, f"{rel_prefix}.h5")
         os.makedirs(os.path.dirname(h5_path), exist_ok=True)
         
@@ -127,29 +105,33 @@ def process_to_h5(root_dir, save_dir):
             with h5py.File(h5_path, 'w') as f:
                 # --- GT 组 ---
                 gt_g = f.create_group('GT')
-                gt_g.create_dataset('rgb', data=gt_rgb) # 1 H W 3
-                gt_g.create_dataset('rays_o', data=gt_rays_o) # 1 H W 3
-                gt_g.create_dataset('rays_d', data=gt_rays_d) # 1 H W 3
+                gt_g.create_dataset('rgb', data=gt_rgb) 
+                gt_g.create_dataset('pose', data=gt_pose)   # 1 4 4 (float64)
+                gt_g.create_dataset('depth', data=gt_depth) # 1 H W (float64)
 
                 # --- occ_ref 组 (对齐后的参考序列) ---
                 ref_g = f.create_group('occ_ref')
-                ref_g.create_dataset('rgb', data=occ_warped_rgb)   # 32 H W 3
-                ref_g.create_dataset('rays_o', data=ref_rays_o)    # 32 H W 3
-                ref_g.create_dataset('rays_d', data=ref_rays_d)    # 32 H W 3
+                # Warped RGB 建议压缩，因为它仍然是 uint8 图片
+                ref_g.create_dataset('rgb', data=occ_warped_rgb)
+                # 不存 rays，只存 poses
+                ref_g.create_dataset('poses', data=ref_poses) 
 
                 # --- occ_center 组 (中心帧) ---
                 center_g = f.create_group('occ_center')
-                center_g.create_dataset('rgb', data=occ_target_img) # 1 H W 3
+                center_g.create_dataset('rgb', data=occ_target_img) 
 
                 # --- world 组 ---
                 world_g = f.create_group('world')
-                world_g.create_dataset('pts3d', data=gt_pts3d) # 1 H W 3
+                # 不存 dense pts3d，如果需要可用 depth + K + pose 恢复
                 world_g.create_dataset('K', data=K)
                 
         except Exception as e:
             print(f"Error saving {h5_path}: {e}")
+            # 如果失败删除半成品
+            if os.path.exists(h5_path):
+                os.remove(h5_path)
 
 if __name__ == "__main__":
     DATA_ROOT = "/home_ssd/sjy/UE5_Project/PCGBiomeForestPoplar/Saved/MovieRenders/sparse_data"
-    SAVE_DIR = "/home_ssd/sjy/Active_cam_recon/data"
+    SAVE_DIR = "/home_ssd/sjy/Active_cam_recon/data" # 建议换个目录或者增加后缀以区分
     process_to_h5(DATA_ROOT, SAVE_DIR)

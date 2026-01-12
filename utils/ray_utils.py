@@ -12,15 +12,16 @@ def generate_rays(h: int, w: int, K, c2w):
     """
     if torch.is_tensor(c2w):
         device = c2w.device
-        dtype = c2w.dtype
+        dtype = torch.float64 # 计算阶段强制使用 float64
         K = K.to(device=device, dtype=dtype)
+        c2w = c2w.to(dtype=dtype)
     else:
         # 如果还在 CPU 上，可以选择转 Tensor 也可以保持 NumPy，这里为了统一用 Torch 逻辑
         # 或者仅仅保持原有的 NumPy 实现？用户的需求是 "改为 GPU 处理"，所以默认转换为 GPU
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        K = torch.from_numpy(K).float().to(device)
-        c2w = torch.from_numpy(c2w).float().to(device)
-        dtype = torch.float32
+        K = torch.from_numpy(K).double().to(device)
+        c2w = torch.from_numpy(c2w).double().to(device)
+        dtype = torch.float64
 
     pixel_center = 0.5
     i, j = torch.meshgrid(
@@ -51,21 +52,23 @@ def generate_rays(h: int, w: int, K, c2w):
     # 4. 归一化方向向量 (Viewdirs)
     viewdirs = directions / (torch.norm(directions, dim=-1, keepdim=True) + 1e-10)
 
-    return origins, viewdirs
+    # 返回时转回 float32
+    return origins.float(), viewdirs.float()
 
 def compute_pts3d(h, w, K, pose, depth):
     """计算世界坐标系下的 3D 点, 支持 GPU"""
     if torch.is_tensor(pose):
         device = pose.device
-        dtype = pose.dtype
+        dtype = torch.float64
         K = K.to(device=device, dtype=dtype)
+        pose = pose.to(dtype=dtype)
         depth = depth.to(device=device, dtype=dtype)
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        K = torch.from_numpy(K).float().to(device)
-        pose = torch.from_numpy(pose).float().to(device)
-        depth = torch.from_numpy(depth).float().to(device)
-        dtype = torch.float32
+        K = torch.from_numpy(K).double().to(device)
+        pose = torch.from_numpy(pose).double().to(device)
+        depth = torch.from_numpy(depth).double().to(device)
+        dtype = torch.float64
         
     pixel_center = 0.5
     i, j = torch.meshgrid(
@@ -87,5 +90,6 @@ def compute_pts3d(h, w, K, pose, depth):
     
     # [3, 3] @ [H, W, 3, 1] + [3]
     pts_world = (R[None, None, ...] @ pts_cam[..., None])[..., 0] + T[None, None, :]
-    return pts_world
+    
+    return pts_world.float()
 

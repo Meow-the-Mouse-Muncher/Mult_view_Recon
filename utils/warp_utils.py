@@ -14,18 +14,19 @@ from typing import Tuple, List, Dict, Optional
 import tqdm
 
 def load_depth(depth_path: str) -> Optional[np.ndarray]:
-    """读取深度图文件 (单位 cm)"""
+    """读取深度图文件 (单位 cm), 强制转换为 float64"""
     if not os.path.exists(depth_path):
         return None
     try:
         # EXR 文件读取，通常深度在第一个通道
-        return cv2.imread(depth_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., 0]
+        d = cv2.imread(depth_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)[..., 0]
+        return d.astype(np.float64)
     except Exception as e:
         print(f"Error reading depth file {depth_path}: {e}")
         return None
 
 def load_pose_info(sequence_dir: str) -> Optional[Dict]:
-    """从序列目录加载相机内参和位姿信息"""
+    """从序列目录加载相机内参和位姿信息 (使用 float64)"""
     transforms_file = os.path.join(sequence_dir, "pose", "transforms.json")
     if not os.path.exists(transforms_file):
         return None
@@ -37,10 +38,10 @@ def load_pose_info(sequence_dir: str) -> Optional[Dict]:
         [data['fl_x'], 0, data['cx']],
         [0, data['fl_y'], data['cy']],
         [0, 0, 1]
-    ], dtype=np.float32)
+    ], dtype=np.float64)
     
     frames = data['frames']
-    poses = [np.array(f['transform_matrix'], dtype=np.float32) for f in frames]
+    poses = [np.array(f['transform_matrix'], dtype=np.float64) for f in frames]
     center_idx = len(frames) // 2
     
     return {
@@ -121,13 +122,6 @@ def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device=
     # 兼容单张图片输入 (处理之前已有的调用方式)
     if src_imgs.ndim == 3:
         src_imgs = src_imgs[None, ...] # [H, W, 3] -> [1, H, W, 3]
-        
-    # 兼容 src_poses 可能是 list 或者 (R, T) tuple
-    if isinstance(src_poses, tuple):
-        # 这种是以前的 frame_transform=(R_c2s, T_c2s) 模式，现在不再支持，需要调用方修改
-        raise ValueError("Deprecated tuple input for src_poses. Please pass full pose matrix.")
-    if isinstance(src_poses, list):
-        src_poses = np.array(src_poses)
     if src_poses.ndim == 2:
          src_poses = src_poses[None, ...] # [4, 4] -> [1, 4, 4]
 
@@ -137,21 +131,21 @@ def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device=
     N, H, W, _ = src_imgs.shape
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     
-    # 1. 移动数据到 GPU
-    src_tensor = torch.from_numpy(src_imgs).float().permute(0, 3, 1, 2).to(device) # [N, 3, H, W]
+    # 1. 移动数据到 GPU (使用 double 精度)
+    src_tensor = torch.from_numpy(src_imgs).double().permute(0, 3, 1, 2).to(device) # [N, 3, H, W]
     src_tensor /= 255.0
     
-    K_tensor = torch.from_numpy(K).float().to(device)
+    K_tensor = torch.from_numpy(K).double().to(device)
     K_inv = torch.inverse(K_tensor)
     
-    center_R = torch.from_numpy(center_pose[:3, :3]).float().to(device)
-    center_T = torch.from_numpy(center_pose[:3, 3]).float().to(device)
+    center_R = torch.from_numpy(center_pose[:3, :3]).double().to(device)
+    center_T = torch.from_numpy(center_pose[:3, 3]).double().to(device)
     
-    src_poses_torch = torch.from_numpy(src_poses).float().to(device)
+    src_poses_torch = torch.from_numpy(src_poses).double().to(device)
     src_R = src_poses_torch[:, :3, :3] # [N, 3, 3]
     src_T = src_poses_torch[:, :3, 3]  # [N, 3]
     
-    depth_m = -torch.from_numpy(center_depth).float().to(device) # [H, W]
+    depth_m = -torch.from_numpy(center_depth).double().to(device) # [H, W]
     
     # 2. 计算相对变换 R_c2s, T_c2s
     # [N, 3, 3]
@@ -163,7 +157,7 @@ def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device=
     
     # 3. 反向投影 Center Rays (一次计算)
     u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
-    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float() # [H, W, 3]
+    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).double() # [H, W, 3]
     pixels = pixels.reshape(-1, 3).T # [3, HW]
     
     rays_camera = K_inv @ pixels # [3, HW]
