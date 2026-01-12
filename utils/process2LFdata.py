@@ -106,8 +106,8 @@ def process_to_h5(root_dir, save_dir):
                 # --- GT 组 ---
                 gt_g = f.create_group('GT')
                 gt_g.create_dataset('rgb', data=gt_rgb) 
-                gt_g.create_dataset('pose', data=gt_pose)   # 1 4 4 (float64)
-                gt_g.create_dataset('depth', data=gt_depth) # 1 H W (float64)
+                gt_g.create_dataset('pose', data=gt_pose)   # 4 4 (float64)
+                gt_g.create_dataset('depth', data=gt_depth) # H W (float64)
 
                 # --- occ_ref 组 (对齐后的参考序列) ---
                 ref_g = f.create_group('occ_ref')

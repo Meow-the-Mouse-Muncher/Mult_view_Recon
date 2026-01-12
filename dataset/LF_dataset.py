@@ -5,27 +5,6 @@ import random
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
 from typing import Optional
-
-
-# gt_g = f.create_group('GT')
-# gt_g.create_dataset('rgb', data=gt_rgb) # 1 H W 3
-# gt_g.create_dataset('rays_o', data=gt_rays_o) # 1 H W 3
-# gt_g.create_dataset('rays_d', data=gt_rays_d) # 1 H W 3
-
-# # --- occ_ref 组 (对齐后的参考序列) ---
-# ref_g = f.create_group('occ_ref')
-# ref_g.create_dataset('rgb', data=occ_warped_rgb)   # 32 H W 3
-# ref_g.create_dataset('rays_o', data=ref_rays_o)    # 32 H W 3
-# ref_g.create_dataset('rays_d', data=ref_rays_d)    # 32 H W 3
-
-# # --- occ_center 组 (中心帧) ---
-# center_g = f.create_group('occ_center')
-# center_g.create_dataset('rgb', data=occ_target_img) # 1 H W 3
-
-# # --- world 组 ---
-# world_g = f.create_group('world')
-# world_g.create_dataset('pts3d', data=gt_pts3d) # 1 H W 3
-# world_g.create_dataset('K', data=K)
 class LFDataset(Dataset):
     """从 HDF5 文件加载 LF 数据的数据集类。"""
     def __init__(self, h5_files: list, split: str = 'train'):
@@ -40,21 +19,20 @@ class LFDataset(Dataset):
         with h5py.File(h5_file, 'r') as f:
             # 读取所有保存的内容
             batch = {
-                # GT 组: 图像转为 [N, 3, H, W], 其他保持 [N, H, W, 3]
-                'gt_rgb': torch.from_numpy(f['GT/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
-                'gt_rays_o': torch.from_numpy(f['GT/rays_o'][:]).float(), # 1 H W 3
-                'gt_rays_d': torch.from_numpy(f['GT/rays_d'][:]).float(),
+                # GT 组: 图像转为 [3, H, W], 位姿 [4, 4], 深度 [H, W]
+                'gt_rgb': torch.from_numpy(f['GT/rgb'][:]).permute(2, 0, 1).float() / 255.0,
+                'gt_pose': torch.from_numpy(f['GT/pose'][:]).double(),
+                'gt_depth': torch.from_numpy(f['GT/depth'][:]).double(),
                 
-                # occ_ref 组 (对齐后的参考序列)
+                # occ_ref 组 (对齐后的参考序列) : 图像转为 [N, 3, H, W], 位姿 [N, 4, 4]
                 'ref_rgb': torch.from_numpy(f['occ_ref/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
-                'ref_rays_o': torch.from_numpy(f['occ_ref/rays_o'][:]).float(), # 32 H W 3
-                'ref_rays_d': torch.from_numpy(f['occ_ref/rays_d'][:]).float(),
+                'ref_poses': torch.from_numpy(f['occ_ref/poses'][:]).double(), 
                 
                 # occ_center 组 (中心帧)
-                'view_rgb': torch.from_numpy(f['occ_center/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
+                'view_rgb': torch.from_numpy(f['occ_center/rgb'][:]).permute(2, 0, 1).float() / 255.0,
                 
                 # world 组
-                'pts3d': torch.from_numpy(f['world/pts3d'][:]).float() # 1 H W 3
+                'K': torch.from_numpy(f['world/K'][:]).double()
             }
             
         return batch
