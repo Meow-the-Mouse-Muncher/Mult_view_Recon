@@ -62,6 +62,12 @@ def process_to_h5(root_dir, save_dir):
     print(f"Found {len(pairs)} pairs. Starting H5 conversion...")
 
     for rel_prefix, gt_dir, occ_dir in tqdm(pairs, desc="H5 Processing"):
+        # 0. 检查目标文件是否已存在
+        h5_path = os.path.join(save_dir, f"{rel_prefix}.h5")
+        if os.path.exists(h5_path):
+            # print(f"Skipping {h5_path} (exists)")
+            continue
+
         data = load_render_data(gt_dir, occ_dir)
         if data is None: continue
         

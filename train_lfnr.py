@@ -4,7 +4,7 @@ import lightning as L
 from torch import nn
 import lpips  # 感知损失库
 from models.recon_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
-from dataset.lightning_dataset import RefocusDataModule
+from dataset.LF_dataset import RefocusDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
@@ -42,7 +42,12 @@ class ReconLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """训练步骤"""
-        gt, occ, view = batch  # GT: [B, 3, H, W], occ: [B, 96, H, W]
+        # 从字典提取数据，并保持旧有输入形状以兼容 Swin-UNet
+        gt = batch['gt_rgb'].squeeze(1)       # [B, 1, 3, H, W] -> [B, 3, H, W]
+        # [B, 32, 3, H, W] -> [B, 96, H, W]
+        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
+        view = batch['center_rgb'].squeeze(1) # [B, 1, 3, H, W] -> [B, 3, H, W]
+        
         pred = self(occ)  # 前向传播: [B, 96, H, W] -> [B, 3, H, W]
         
         # 计算 MSE 损失
@@ -65,7 +70,10 @@ class ReconLightningModule(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
-        gt, occ, view = batch
+        gt = batch['gt_rgb'].squeeze(1)
+        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
+        view = batch['center_rgb'].squeeze(1)
+        
         pred = self(occ)
         
         # 计算损失
@@ -104,7 +112,10 @@ class ReconLightningModule(L.LightningModule):
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
-        gt, occ, view = batch
+        gt = batch['gt_rgb'].squeeze(1)
+        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
+        view = batch['center_rgb'].squeeze(1)
+        
         pred = self(occ)
         
         # 计算损失

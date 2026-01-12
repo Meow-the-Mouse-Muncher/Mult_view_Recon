@@ -7,8 +7,27 @@ import lightning as L
 from typing import Optional
 
 
-class RefocusDataset(Dataset):
-    """从 HDF5 文件加载 GT/occ 数据的数据集类。"""
+# gt_g = f.create_group('GT')
+# gt_g.create_dataset('rgb', data=gt_rgb) # 1 H W 3
+# gt_g.create_dataset('rays_o', data=gt_rays_o) # 1 H W 3
+# gt_g.create_dataset('rays_d', data=gt_rays_d) # 1 H W 3
+
+# # --- occ_ref 组 (对齐后的参考序列) ---
+# ref_g = f.create_group('occ_ref')
+# ref_g.create_dataset('rgb', data=occ_warped_rgb)   # 32 H W 3
+# ref_g.create_dataset('rays_o', data=ref_rays_o)    # 32 H W 3
+# ref_g.create_dataset('rays_d', data=ref_rays_d)    # 32 H W 3
+
+# # --- occ_center 组 (中心帧) ---
+# center_g = f.create_group('occ_center')
+# center_g.create_dataset('rgb', data=occ_target_img) # 1 H W 3
+
+# # --- world 组 ---
+# world_g = f.create_group('world')
+# world_g.create_dataset('pts3d', data=gt_pts3d) # 1 H W 3
+# world_g.create_dataset('K', data=K)
+class LFDataset(Dataset):
+    """从 HDF5 文件加载 LF 数据的数据集类。"""
     def __init__(self, h5_files: list, split: str = 'train'):
         self.h5_files = h5_files
         self.split = split
@@ -19,28 +38,29 @@ class RefocusDataset(Dataset):
     def __getitem__(self, idx):
         h5_file = self.h5_files[idx]
         with h5py.File(h5_file, 'r') as f:
-            gt = torch.from_numpy(f['gt'][:]).float()/255      
-            occ = torch.from_numpy(f['occ'][:]).float()/255
-            occ_mid = torch.from_numpy(f['view'][:]).float()/255
-        
-        # 数据增强：随机翻转
-        if self.split == 'train':
-            # 随机水平翻转
-            if random.random() > 0.5:
-                gt = torch.flip(gt, dims=[2])      # [C, H, W] -> W 是 dim 2
-                occ = torch.flip(occ, dims=[2])
-                occ_mid = torch.flip(occ_mid, dims=[2])
+            # 读取所有保存的内容
+            batch = {
+                # GT 组: 图像转为 [N, 3, H, W], 其他保持 [N, H, W, 3]
+                'gt_rgb': torch.from_numpy(f['GT/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
+                'gt_rays_o': torch.from_numpy(f['GT/rays_o'][:]).float(), # 1 H W 3
+                'gt_rays_d': torch.from_numpy(f['GT/rays_d'][:]).float(),
+                
+                # occ_ref 组 (对齐后的参考序列)
+                'ref_rgb': torch.from_numpy(f['occ_ref/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
+                'ref_rays_o': torch.from_numpy(f['occ_ref/rays_o'][:]).float(), # 32 H W 3
+                'ref_rays_d': torch.from_numpy(f['occ_ref/rays_d'][:]).float(),
+                
+                # occ_center 组 (中心帧)
+                'view_rgb': torch.from_numpy(f['occ_center/rgb'][:]).permute(0, 3, 1, 2).float() / 255.0,
+                
+                # world 组
+                'pts3d': torch.from_numpy(f['world/pts3d'][:]).float() # 1 H W 3
+            }
             
-            # 随机垂直翻转
-            if random.random() > 0.5:
-                gt = torch.flip(gt, dims=[1])      # [C, H, W] -> H 是 dim 1
-                occ = torch.flip(occ, dims=[1])
-                occ_mid = torch.flip(occ_mid, dims=[1])
+        return batch
 
-        return gt, occ, occ_mid
-
-class RefocusDataModule(L.LightningDataModule):
-    """PyTorch Lightning 数据模块，用于管理 Refocus 数据集."""
+class LFDataModule(L.LightningDataModule):
+    """PyTorch Lightning 数据模块，用于管理 LF 数据集."""
     def __init__(self, data_dir: str, model: str = None, batch_size: int = 4, num_workers: int = 4):
         super().__init__()
         # 如果指定了 model(mode)，则只读取对应目录下的数据
@@ -75,10 +95,10 @@ class RefocusDataModule(L.LightningDataModule):
             
             # 划分：前 90% 为 train，后 10% 为 val
             train_size = int(0.9 * len(shuffled_files))
-            self.train_dataset = RefocusDataset(shuffled_files[:train_size], split='train')
-            self.val_dataset = RefocusDataset(shuffled_files[train_size:], split='val')
+            self.train_dataset = LFDataset(shuffled_files[:train_size], split='train')
+            self.val_dataset = LFDataset(shuffled_files[train_size:], split='val')
         elif stage == 'test':
-            self.test_dataset = RefocusDataset(self.h5_files, split='test')
+            self.test_dataset = LFDataset(self.h5_files, split='test')
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
