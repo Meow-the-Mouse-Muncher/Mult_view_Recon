@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/home/anaconda3/envs/Mult_view_Recon/bin/python",
+    "python.terminal.activateEnvInSelectedTerminal": true,
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ]
+}

@@ -8,6 +8,7 @@ import numpy as np
 import os
 import cv2
 import re
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import torch
 from typing import Tuple, List, Dict, Optional
 import tqdm
@@ -248,7 +249,8 @@ def load_render_data(gt_dir: str, occ_dir: str) -> Optional[Dict]:
     gt_rgb_paths, gt_dep_paths = get_paths(gt_dir)
 
     # 2. 处理深度图和缩放因子
-    gt_center_dep = load_depth(gt_dep_paths[center_idx])/100 # cm -> m
+    gt_center_dep = load_depth(gt_dep_paths[center_idx])
+    gt_center_dep /= 100.0 # cm -> m
     if gt_center_dep is None:
         return None
         

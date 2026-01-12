@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "/home/anaconda3/envs/Mult_view_Recon/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug Process Data",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/dataset/process2LFdata.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "/home/anaconda3/envs/Mult_view_Recon/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+    ]
+}
