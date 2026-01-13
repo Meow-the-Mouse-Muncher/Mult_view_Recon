@@ -3,16 +3,10 @@ import os
 import re
 from typing import List, Tuple
 from functools import partial
-from utils.warp_utils import (
-    load_render_data, 
-    precompute_transforms, 
-    refocus_image_gpu
-)
-# 移除了 ray_utils 的引用，因为这里不再计算光线
+from utils.warp_utils import load_render_data
 import numpy as np
 import cv2
 import h5py
-import torch
 from tqdm import tqdm
 
 def find_sequence_pairs(root_dir: str) -> List[Tuple[str, str, str]]:
@@ -82,19 +76,9 @@ def process_to_h5(root_dir, save_dir):
         ref_imgs = data['occ_ref']['images'] 
         ref_poses = data['occ_ref']['poses'] 
         
-        # GPU 批量 warp 图像 (Warping比较耗时，结果建议保留)
-        if len(ref_imgs) > 0:
-            occ_warped_rgb = refocus_image_gpu(
-                src_imgs=ref_imgs,
-                center_depth=gt_depth,
-                src_poses=ref_poses,
-                center_pose=gt_pose,
-                K=K,
-                device='cuda'
-            )
-        else:
-            occ_warped_rgb = np.array([])
-
+        # 移除预处理阶段的 Warping/Refocus，改为训练时在线采样
+        # 这样节省存储空间，且避免二次插值
+        
         occ_target_img = data['occ_target']['image']
 
         # 4. 保存到 H5
@@ -109,10 +93,10 @@ def process_to_h5(root_dir, save_dir):
                 gt_g.create_dataset('pose', data=gt_pose)   # 4 4 (float64)
                 gt_g.create_dataset('depth', data=gt_depth) # H W (float64)
 
-                # --- occ_ref 组 (对齐后的参考序列) ---
+                # --- occ_ref 组 ---
                 ref_g = f.create_group('occ_ref')
-                # Warped RGB 建议压缩，因为它仍然是 uint8 图片
-                ref_g.create_dataset('rgb', data=occ_warped_rgb)
+                # 保存原始 RGB 图像序列 (Original Images)，训练时使用 Grid Sample 获取特征
+                ref_g.create_dataset('rgb', data=ref_imgs)
                 # 不存 rays，只存 poses
                 ref_g.create_dataset('poses', data=ref_poses) 
 

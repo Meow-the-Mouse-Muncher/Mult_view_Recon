@@ -157,7 +157,8 @@ def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device=
     
     # 3. 反向投影 Center Rays (一次计算)
     u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
-    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).double() # [H, W, 3]
+    # Add 0.5 to align with pixel center
+    pixels = torch.stack([u + 0.5, v + 0.5, torch.ones_like(u)], dim=-1).double() # [H, W, 3]
     pixels = pixels.reshape(-1, 3).T # [3, HW]
     
     rays_camera = K_inv @ pixels # [3, HW]
@@ -189,6 +190,57 @@ def refocus_image_gpu(src_imgs, center_depth, src_poses, center_pose, K, device=
     
     # 如果原始输入是单张，则返回单张 (去掉 batch 维度)
     return res[0] if res.shape[0] == 1 else res
+
+def get_sampling_grid(pts_3d: torch.Tensor, ref_poses: torch.Tensor, K: torch.Tensor, H: int, W: int):
+    """
+    计算 3D 点在参考相机平面的投影坐标 (Sampling Grid)。
+    用于 Dataset 中生成 grid_sample 所需的网格。
+    Args:
+        pts_3d: [n_rays, 3] 世界坐标系下的 3D 点
+        ref_poses: [N, 4, 4] 参考相机位姿 (c2w)
+        K: [3, 3] 相机内参
+        H, W: 图像尺寸
+    Returns:
+        sampling_grid: [N, n_rays, 2] 归一化坐标 [-1, 1], 用于 grid_sample, 最后一个维度是 (x, y)
+    """
+    N_ref = ref_poses.shape[0]
+    n_rays = pts_3d.shape[0]
+    
+    # R_w2c = R_c2w^T, T_w2c = -R_c2w^T * T_c2w
+    R_w2c = ref_poses[:, :3, :3].transpose(1, 2) # [N, 3, 3]
+    T_w2c = -torch.bmm(R_w2c, ref_poses[:, :3, 3:4]) # [N, 3, 1]
+    
+    # [n_rays, 3] -> [N, 3, n_rays]
+    pts_expanded = pts_3d.unsqueeze(0).expand(N_ref, -1, -1).transpose(1, 2)
+    
+    # 投影到相机坐标系 P_cam = R * P_world + T
+    pts_cam = torch.bmm(R_w2c, pts_expanded) + T_w2c # [N, 3, n_rays]
+    
+    # 投影到像素平面 P_uv = K * P_cam (Homogeneous)
+    K_expanded = K.unsqueeze(0).expand(N_ref, -1, -1)
+    pts_uv = torch.bmm(K_expanded, pts_cam) 
+    
+    # Perspective Divide
+    z = pts_uv[:, 2:3, :] + 1e-6
+    uv = pts_uv[:, :2, :] / z # [N, 2, n_rays]
+    
+    # Normalize to [-1, 1] for grid_sample(align_corners=True)
+    # 假设内参 K 是基于 Input Image 的 (0,0) 为 Pixel(0,0) 的左上角
+    # 因此 Pixel(0,0) 的中心是 (0.5, 0.5)
+    # align_corners=True 时: -1 对应 Index 0, 1 对应 Index W-1
+    # 我们希望 projected u=0.5 (Index 0 Center) -> -1
+    #              u=W-0.5 (Index W-1 Center) -> 1
+    
+    # 公式: 2 * (u - 0.5) / (W - 1) - 1
+    # u=0.5 => 2*0 - 1 = -1 (Correct)
+    # u=W-0.5 => 2*(W-1)/(W-1) - 1 = 1 (Correct)
+    
+    # uv[0] is u (x), uv[1] is v (y)
+    grid_u = 2.0 * (uv[:, 0, :] - 0.5) / (W - 1) - 1.0
+    grid_v = 2.0 * (uv[:, 1, :] - 0.5) / (H - 1) - 1.0
+    
+    sampling_grid = torch.stack([grid_u, grid_v], dim=-1) # [N, n_rays, 2]
+    return sampling_grid
 
 
 def recenter_poses(poses):

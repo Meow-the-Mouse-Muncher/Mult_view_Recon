@@ -3,30 +3,16 @@ import torch
 import lightning as L
 from torch import nn
 import lpips  # 感知损失库
-from models.LF_model import PyramidUNet, ModelConfig, SwinUNetConfigs, create_swin_unet
-from dataset.LF_dataset import RefocusDataModule
+from models.lfnr import LFNR
+from dataset.LF_dataset import LFDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 class LFModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 Swin-UNet。"""
-    def __init__(self, model_config: ModelConfig = None, model_size: str = 'small'):
+    def __init__(self, n_rays=4096):
         super().__init__()
-        
-        # 如果没有提供配置，使用预定义配置
-        if model_config is None:
-            self.model = create_swin_unet(
-                model_size=model_size, 
-                in_chans=32*3,  # 32个视角 * 3通道
-                out_chans=3,    # RGB 输出
-                img_size=512
-            )
-        else:
-            self.model = PyramidUNet(model_config)
-            
-        # 损失函数
-        self.mse_loss = nn.MSELoss()
-        self.perceptual_loss = lpips.LPIPS(net='vgg')  # 使用 AlexNet 作为感知损失
+        self.n_rays = n_rays
         
         # 损失权重
         self.mse_weight = 10
@@ -40,13 +26,15 @@ class LFModule(L.LightningModule):
     def forward(self, occ):
         return self.model(occ)  # 输入多视角数据，输出重建的 RGB 图像
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, ):
         """训练步骤"""
-        # 从字典提取数据，并保持旧有输入形状以兼容 Swin-UNet
-        gt = batch['gt_rgb'].squeeze(1)       # [B, 1, 3, H, W] -> [B, 3, H, W]
-        # [B, 32, 3, H, W] -> [B, 96, H, W]
-        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
-        view = batch['center_rgb'].squeeze(1) # [B, 1, 3, H, W] -> [B, 3, H, W]
+        # 从字典提取数据
+        gt = batch['gt_rgb']
+        gt_pose = batch['gt_pose']
+        gt_depth = batch['gt_depth']
+        occ = batch['ref_rgb']
+        occ_poses = batch['ref_poses']
+        K = batch['K']
         
         pred = self(occ)  # 前向传播: [B, 96, H, W] -> [B, 3, H, W]
         
@@ -164,18 +152,22 @@ class LFModule(L.LightningModule):
         }
 
 if __name__ == "__main__":
-    print("=== 开始训练 Swin-UNet 模型 (MSE + 感知损失) ===")
+    print("=== 开始训练 LFNR 模型 ===")
     
-    # 方案1: 使用便捷函数创建模型（推荐）
-    model = ReconLightningModule(model_size='small')  # 可选: 'tiny', 'small', 'base'
+    # 加载配置
+    config = get_config()
     mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     
-    # 创建数据模块
-    dm = RefocusDataModule(
-        data_dir="sparse_data", 
+    # 1. 初始化模型包装器
+    model = LFModule(config=config, n_rays=config.train.num_rays)
+    
+    # 2. 创建数据模块
+    dm = LFDataModule(
+        data_dir="sparse_data", # 指向你生成的 h5 文件夹
         model=mode,
-        batch_size=6,  # Swin-UNet 显存占用较大，减小 batch size
-        num_workers=8
+        batch_size=config.dataset.batch_size if hasattr(config.dataset, 'batch_size') else 2,
+        num_workers=8,
+        n_rays=config.train.num_rays
     )
 
     # 创建 Trainer
