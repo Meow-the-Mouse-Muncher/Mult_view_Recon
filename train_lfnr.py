@@ -2,144 +2,121 @@ import os
 import torch
 import lightning as L
 from torch import nn
-import lpips  # 感知损失库
+import lpips
 from models.lfnr import LFNR
 from dataset.LF_dataset import LFDataModule
+from configs.config import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 class LFModule(L.LightningModule):
-    """Lightning 模型包装器，用于训练 Swin-UNet。"""
-    def __init__(self, n_rays=4096):
+    """Lightning 模型包装器，用于训练 LFNR。"""
+    def __init__(self, config, n_rays=4096):
         super().__init__()
+        # 直接保存整个 config 对象
+        self.save_hyperparameters(config)
+        self.config = config
         self.n_rays = n_rays
         
-        # 损失权重
-        self.mse_weight = 10
-        self.perceptual_weight = 1e-2
+        # 初始化模型：仅传一个 config 对象
+        self.model = LFNR(config=config)
         
-        # 保存超参数
-        # self.save_hyperparameters()
-        self.psnr = PeakSignalNoiseRatio()
-        self.ssim = StructuralSimilarityIndexMeasure()
+        # 损失函数
+        self.mse_loss = nn.MSELoss()
+        self.lpips_loss = lpips.LPIPS(net='vgg')
+        
+        # 指标
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
 
-    def forward(self, occ):
-        return self.model(occ)  # 输入多视角数据，输出重建的 RGB 图像
+    def forward(self, batch):
+        return self.model.forward(batch)
 
-    def training_step(self, batch, ):
-        """训练步骤"""
-        # 从字典提取数据
-        gt = batch['gt_rgb']
-        gt_pose = batch['gt_pose']
-        gt_depth = batch['gt_depth']
-        occ = batch['ref_rgb']
-        occ_poses = batch['ref_poses']
-        K = batch['K']
+    def training_step(self, batch, batch_idx):
+        """训练步骤 (Sparse Ray Training)"""
+        # 1. 前向传播
+        # 返回值: 预测RGB, 重叠区RGB(如有), 注意力权重, 学习到的相机嵌入
+        pred_rgb, rgb_overlap, attn_weights, learned_embed = self(batch)
+        gt_rgb = batch['gt_rgb'] # [B, n_rays, 3]
         
-        pred = self(occ)  # 前向传播: [B, 96, H, W] -> [B, 3, H, W]
+        # 2. 计算损耗
+        # 主预测损失
+        loss_pred = self.mse_loss(pred_rgb, gt_rgb)
         
-        # 计算 MSE 损失
-        mse_loss = self.mse_loss(pred, gt)
+        # 重叠区域/辅助损失 (如果模型支持)
+        loss_overlap = self.mse_loss(rgb_overlap, gt_rgb)
+        # 总损失 (L2权重衰减已在AdamW中处理)
+        loss = loss_pred + loss_overlap
         
-        # 计算感知损失 (LPIPS 期望输入范围 [-1, 1])
-        pred_norm = pred * 2 - 1  # [0, 1] -> [-1, 1]
-        gt_norm = gt * 2 - 1      # [0, 1] -> [-1, 1]
-        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
-        
-        # 总损失
-        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
-        
-        # 记录损失
-        self.log('train/total_loss', total_loss, on_step=True, prog_bar=True)
-        self.log('train/mse_loss', mse_loss, on_step=True, prog_bar=True)
-        self.log('train/perceptual_loss', perceptual_loss, on_step=True, prog_bar=True)
-        
-        return total_loss
+        # 3. 记录日志
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('train/loss_pred', loss_pred, on_step=True, on_epoch=True, sync_dist=True)
+        self.log('train/loss_overlap', loss_overlap, on_step=True, on_epoch=True, sync_dist=True)
+            
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证步骤"""
-        gt = batch['gt_rgb'].squeeze(1)
-        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
-        view = batch['center_rgb'].squeeze(1)
+        """验证步骤 (通常渲染全图)"""
+        # 前向传播
+        # 在验证阶段，我们可能只关心最终的 pred_rgb
+        outputs = self(batch)
+        if isinstance(outputs, tuple):
+            pred_rgb = outputs[0]
+        else:
+            pred_rgb = outputs
+            
+        gt_rgb = batch['gt_rgb'] # [B, H*W, 3]
         
-        pred = self(occ)
-        
-        # 计算损失
-        mse_loss = self.mse_loss(pred, gt)
-        pred_norm = pred * 2 - 1
-        gt_norm = gt * 2 - 1
-        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
-        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
-        
-        # 计算指标
-        psnr_val = self.psnr(pred, gt)
-        ssim_val = self.ssim(pred, gt)
-        
-        # 记录验证损失
-        self.log('val/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val/psnr', psnr_val, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val/ssim', ssim_val, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # 每个验证epoch记录第一个batch的图像
+        # 计算 PSNR 基础指标
+        psnr_val = self.psnr(pred_rgb.clamp(0, 1), gt_rgb.clamp(0, 1))
+        self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # 记录图像可视化 (仅记录 batch 中的第一张)
         if batch_idx == 0:
-            # 取第一张图像
-            view_img = view[0]  # [3, H, W]
-            pred_img = pred[0]  # [3, H, W]
-            gt_img = gt[0]      # [3, H, W]
+            # 这里的 H, W 需要在 Dataset 提供并在 batch 中带上
+            H, W = batch['H'][0].item(), batch['W'][0].item()
             
-            # 拼接图像：左中右 = view, pred, GT
-            combined = torch.cat([view_img, pred_img, gt_img], dim=2)  # [3, H, 3*W]
+            # Reshape: [B=1, H*W, 3] -> [3, H, W]
+            p_img = pred_rgb[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1)
+            g_img = gt_rgb[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1)
             
-            # 记录到 TensorBoard
-            self.logger.experiment.add_image(
-                'val_images/view_pred_gt', 
-                combined, 
-                self.current_epoch
-            )
-        return total_loss
+            # 计算图像级指标
+            ssim_val = self.ssim(p_img.unsqueeze(0), g_img.unsqueeze(0))
+            # LPIPS 需要 [-1, 1] 范围输入
+            lpips_val = self.lpips_loss(p_img.unsqueeze(0)*2-1, g_img.unsqueeze(0)*2-1).mean()
+            
+            self.log('val/ssim', ssim_val, on_epoch=True)
+            self.log('val/lpips', lpips_val, on_epoch=True)
+
+            # 写入 TensorBoard
+            self.logger.experiment.add_image('val/prediction', p_img, self.global_step)
+            self.logger.experiment.add_image('val/ground_truth', g_img, self.global_step)
+            
+        return psnr_val
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
-        gt = batch['gt_rgb'].squeeze(1)
-        occ = batch['ref_rgb'].reshape(batch['ref_rgb'].shape[0], -1, *batch['ref_rgb'].shape[-2:])
-        view = batch['center_rgb'].squeeze(1)
+        pred_rgb = self(batch)
+        gt_rgb = batch['gt_rgb']
         
-        pred = self(occ)
-        
-        # 计算损失
-        mse_loss = self.mse_loss(pred, gt)
-        pred_norm = pred * 2 - 1
-        gt_norm = gt * 2 - 1
-        perceptual_loss = self.perceptual_loss(pred_norm, gt_norm).mean()
-        total_loss = self.mse_weight * mse_loss + self.perceptual_weight * perceptual_loss
-        
-        # 计算指标
-        psnr_val = self.psnr(pred, gt)
-        ssim_val = self.ssim(pred, gt)
-        
-        # 记录测试损失
-        self.log('test/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('test/mse_loss', mse_loss, on_step=False, on_epoch=True)
-        self.log('test/perceptual_loss', perceptual_loss, on_step=False, on_epoch=True)
-        self.log('test/psnr', psnr_val, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('test/ssim', ssim_val, on_step=False, on_epoch=True, prog_bar=True)
-        return total_loss
+        psnr_val = self.psnr(pred_rgb, gt_rgb)
+        self.log('test/psnr', psnr_val, on_epoch=True)
+        return psnr_val
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
-        # 使用 AdamW 优化器，对 Transformer 模型效果更好
         optimizer = torch.optim.AdamW(
             self.parameters(), 
-            lr=1e-4,
-            weight_decay=0.01,  # 权重衰减
+            lr=self.config.train.lr_init,
+            weight_decay=self.config.train.weight_decay,
             betas=(0.9, 0.999)
         )
         
         # 使用余弦退火学习率调度器
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, 
-            T_max=600,  # 最大轮数
-            eta_min=1e-6  # 最小学习率
+            T_max=self.config.train.num_epochs,
+            eta_min=self.config.train.lr_final
         )
         
         return {
@@ -156,48 +133,41 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config()
-    mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
+    mode = "fix_line" # mode =[fix_line,rot_arc,rot_line]
     
     # 1. 初始化模型包装器
     model = LFModule(config=config, n_rays=config.train.num_rays)
     
     # 2. 创建数据模块
     dm = LFDataModule(
-        data_dir="sparse_data", # 指向你生成的 h5 文件夹
+        data_dir="data",
         model=mode,
-        batch_size=config.dataset.batch_size if hasattr(config.dataset, 'batch_size') else 2,
+        batch_size=1, # 训练时每个 batch 包含 N_rays，所以 batch_size 设为 1 即可
         num_workers=8,
         n_rays=config.train.num_rays
     )
 
     # 创建 Trainer
     trainer = L.Trainer(
-        max_epochs=2400,
+        max_epochs=config.train.num_epochs,
         accelerator="gpu",
         devices=[0],  
         strategy="auto",
         logger=TensorBoardLogger("logs", name=mode, version=None), 
-        # 回调函数
         callbacks=[
-            # 模型检查点
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
-                filename="swin-unet-{epoch:02d}",
-                monitor="val/total_loss",  # 推荐监控验证损失
-                mode="min",
+                filename="lfnr-{epoch:02d}",
+                monitor="val/psnr",
+                mode="max",
                 save_top_k=4,
             ),
-            # 学习率监控
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
-        
-        # 日志设置
         log_every_n_steps=20,
-        # 验证集间隔
-        check_val_every_n_epoch=20,
-        # 梯度裁剪（对 Transformer 有帮助）
-        # gradient_clip_val=1.0,
+        check_val_every_n_epoch=5, # 减少验证频率
     )
+
 
     # 打印模型信息
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")

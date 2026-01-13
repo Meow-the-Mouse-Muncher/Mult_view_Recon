@@ -19,115 +19,190 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-
-# No direct equivalent for efficient_conv, using nn.Conv2d instead in logic
-# Assume projector and transformer are now PyTorch modules
-from . import projector
 from . import transformer
-from . import vanilla_nlf
+from utils import lf_utils
 
-class LFNR(vanilla_nlf.VanillaNLF):
+class LFNR(nn.Module):
     """Light Field Neural Rendering model in PyTorch."""
-    def __init__(self, mlp_config, render_config, encoding_config, lf_config, 
-                 epipolar_config, epipolar_transformer_config, view_transformer_config, return_attn=False):
-        super().__init__(mlp_config, render_config, encoding_config, lf_config)
+    def __init__(self, config):
+        super().__init__()
+    
+        # 将各子配置直接挂载，简化引用
+        self.config = config
+        self.m_config = config.model
+        self.cnn_config = config.model.cnn
+        self.lf_config = config.lightfield
         
-        self.epipolar_transformer_config = epipolar_transformer_config
-        self.view_transformer_config = view_transformer_config
-        self.epipolar_config = epipolar_config
-        self.return_attn = return_attn
+        # 获取返回权限
+        self.return_attn = getattr(self.m_config, 'return_attn', False)
         
-        # Modules
-        self.projector = projector.RayProjector(self.epipolar_config)
-        self.epipolar_transformer = transformer.SelfAttentionTransformer(self.epipolar_transformer_config)
-        self.view_transformer = transformer.SelfAttentionTransformer(self.view_transformer_config)
+        # 工具和模块初始化：直接传对应的子配置段
+        self.lightfield = lf_utils.get_lightfield_obj(self.lf_config)
         
-        # Correspondence layers
-        self.epipolar_correspondence = nn.Linear(epipolar_transformer_config.embed_dim, 1) # Assumed input dim
-        self.view_correspondence = nn.Linear(view_transformer_config.embed_dim, 1) # Assumed input dim
+        # Transformer 定义
+        self.view_transformer = transformer.SelfAttentionTransformer(self.m_config.view_transformer)
         
-        self.rgb_dense = nn.Linear(view_transformer_config.embed_dim, render_config.num_rgb_channels)
+        # 后续层使用点号访问对应配置
+        self.view_correspondence = nn.Linear(self.m_config.view_transformer.embed_dim, 1)
+        self.rgb_dense = nn.Linear(self.m_config.view_transformer.embed_dim, self.m_config.num_rgb_channels)
         
-        # Transforms (checking simple linear mapping)
-        # Note: In JAX 'DenseGeneral' was used. In PyTorch 'Linear' is usually enough for last dim projection.
-        self.key_transform = nn.Linear(epipolar_transformer_config.key_dim, epipolar_transformer_config.embed_dim) 
-        self.query_transform = nn.Linear(epipolar_transformer_config.query_dim, epipolar_transformer_config.embed_dim)
+        # Transforms for Query/Key mapping
+        self.key_transform = nn.Linear(self.m_config.epipolar_transformer.key_dim, self.m_config.epipolar_transformer.embed_dim)   
+        self.query_transform = nn.Linear(self.m_config.view_transformer.query_dim, self.m_config.view_transformer.embed_dim)
         
-        self.key_transform2 = nn.Linear(view_transformer_config.key_dim, view_transformer_config.embed_dim)
-        self.query_transform2 = nn.Linear(view_transformer_config.query_dim, view_transformer_config.embed_dim)
-        
-        if self.epipolar_config.use_learned_embedding:
+        if self.cnn_config.use_learned_embedding:
              self.camera_embedding = nn.Embedding(
-                 num_embeddings=self.epipolar_config.num_train_views,
-                 embedding_dim=self.epipolar_config.embedding_dim 
+                 num_embeddings=self.cnn_config.num_train_views,
+                 embedding_dim=self.cnn_config.embedding_dim 
              )
 
-        if self.epipolar_config.use_conv_features:
-            # Replacing efficient_conv with standard Conv
-            self.conv_layer1 = nn.Conv2d(
+        if self.cnn_config.use_conv_features:
+            self.conv_layer = nn.Conv2d(
                 in_channels=3, 
-                out_channels=self.epipolar_config.conv_feature_dim,
-                kernel_size=self.epipolar_config.ksize1,
-                padding=self.epipolar_config.ksize1//2
+                out_channels=self.cnn_config.conv_feature_dim,
+                kernel_size=self.cnn_config.ksize,
+                padding=self.cnn_config.ksize // 2
             )
             self.feature_activation = nn.ELU()
 
-    def _get_query(self, rays):
-        # Placeholder for LF encoding logic
-        # return q_samples, q_samples_enc, q_mask
-        pass
+    def _get_query(self, rays_o, rays_d):
+        """将目标光线编码为光场特征。"""
+        _, q_enc, _ = self.lightfield.get_lf_encoding(rays_o, rays_d)
+        return q_enc
+    def _get_key(self, projected_rgb_and_feat, ref_rays_o, ref_rays_d, pts_3d):
+        """参考视角下的 光场编码特征||世界坐标编码||rgb和cnn特征||相机嵌入特征 """
+        B, N, n_rays, _ = projected_rgb_and_feat.shape
 
-    def _get_key(self, projected_rays, projected_rgb_and_feat, wcoords, ref_idx):
-         # Placeholder for key encoding
-         pass
-    
-    def _add_learned_embedding_to_key(self, input_k, ref_idx):
-        # learned_embedding logic
-        pass
+        # 1. 光场编码 (针对参考光线): [B, N, n_rays, D_lf]
+        _, k_enc, _ = self.lightfield.get_lf_encoding(ref_rays_o, ref_rays_d)
 
-    def _get_pixel_projection(self, projected_coordinates, ref_images):
-        if self.epipolar_config.use_conv_features:
-            # Conv expects [B, C, H, W]
-            ref_images_permuted = ref_images.permute(0, 3, 1, 2)
-            ref_features = self.feature_activation(self.conv_layer1(ref_images_permuted))
-            # Permute back or handle in projector
-            ref_features = ref_features.permute(0, 2, 3, 1)
-            
-            projected_features = self.projector.get_interpolated_rgb(projected_coordinates, ref_features)
-            projected_rgb = self.projector.get_interpolated_rgb(projected_coordinates, ref_images)
-            projected_features = torch.cat([projected_features, projected_rgb], dim=-1)
+        # 2. 3D 点地理位置编码: [B, n_rays, D_w]
+        wcoords_enc_raw = lf_utils.posenc(
+            pts_3d,
+            self.lf_config.min_deg_point,
+            self.lf_config.max_deg_point,
+        )
+        # 扩展维度以匹配参考视角 N: [B, N, n_rays, D_w]
+        wcoords_enc = wcoords_enc_raw.unsqueeze(1).expand(-1, N, -1, -1)
+
+        # 3. 学习到的相机嵌入 (Camera Embedding): [N, D_cam]
+        # 注意：这里使用 arange(N)，确保每个视角有独立的 ID
+        indices = torch.arange(N, device=projected_rgb_and_feat.device)
+        learned_embed_raw = self.camera_embedding(indices) # [N, D_cam]
+        
+        # 扩展到 Batch 和 Rays 维度: [B, N, n_rays, D_cam]
+        learned_embed = learned_embed_raw[None, :, None, :].expand(B, -1, n_rays, -1)
+
+        # 4. 拼接所有特征 [B, N, n_rays, D_total]
+        # k_enc: [B, N, n_rays, D_lf]
+        # wcoords_enc: [B, N, n_rays, D_w]
+        # projected_rgb_and_feat: [B, N, n_rays, C+3]
+        # learned_embed: [B, N, n_rays, D_cam]
+        input_k = torch.cat([
+            k_enc, 
+            wcoords_enc, 
+            projected_rgb_and_feat, 
+            learned_embed
+        ], dim=-1)
+
+        return input_k,learned_embed
+
+    def _get_pixel_projection(self, sampling_grid, ref_images):
+        """
+        从参考图像中采样 RGB 和 CNN 特征。
+        """
+        B, N, C, H, W = ref_images.shape
+        ref_images_flat = ref_images.reshape(B * N, C, H, W)
+        grid_flat = sampling_grid.reshape(B * N, -1, 1, 2)
+
+        # 1. 采样原始 RGB
+        projected_rgb = F.grid_sample(ref_images_flat, grid_flat, align_corners=True, mode='bilinear')
+        projected_rgb = projected_rgb.squeeze(-1).permute(0, 2, 1) # [B*N, n_rays, 3]
+
+        # 2. 提取并采样 CNN 特征
+        if self.cnn_config.use_conv_features:
+            ref_features = self.feature_activation(self.conv_layer(ref_images_flat))
+            projected_features = F.grid_sample(ref_features, grid_flat, align_corners=True, mode='bilinear')
+            projected_features = projected_features.squeeze(-1).permute(0, 2, 1) # [B*N, n_rays, feat_dim]
+            out = torch.cat([projected_features, projected_rgb], dim=-1)
         else:
-            projected_features = self.projector.get_interpolated_rgb(projected_coordinates, ref_images)
+            out = projected_rgb
             
-        return projected_features
+        return out.reshape(B, N, -1, out.shape[-1])
+    def _predict_color(self, input_q, input_k):
+        """
+        基于 Transformer 的注意力机制预测颜色。
+        Args:
+            input_q: [B, n_rays, q_dim]
+            input_k: [B, N, n_rays, k_dim]
+        Returns:
+            rgb: [B, n_rays, 3]
+            attn_weights: [B, n_rays, N, 1]
+        """
+        B, N, n_rays, _ = input_k.shape
+        
+        q = self.query_transform(input_q)
+        k = self.key_transform(input_k)
+        q_k_combined = torch.cat([q, k], dim=1)
+        out = self.view_transformer(q_k_combined)
 
-    def _get_avg_features(self, input_q, input_k):
-        # PyTorch impl of average features
-        pass
+        # 4. 分离更新后的 Query 和 Keys
+        refined_query = out[:, 0:1, :]        
+        refined_key = out[:, 1:, :]             
 
-    def _predict_color(self, input_q, input_k, learned_embedding):
-        pass
+        # 5. 计算视角间的注意力权重 (Cross-view Correlation)
+        refined_query_expanded = refined_query.expand(-1, N, -1)
+        
+        # 拼接做相关性计算
+        concat_feat = torch.cat([refined_query_expanded, refined_key], dim=-1) # [..., N, embed_dim*2]
+        
+        # 计算权重并 Softmax
+        attn_weights = self.view_correspondence(concat_feat) # [B*n_rays, N, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)        # 在 N 维度做归一化
+
+        # 6. 加权聚合特征并映射为 RGB
+        # 加权平均后的特征: [B*n_rays, embed_dim]
+        combined_feature = (refined_key * attn_weights).sum(dim=1)
+        
+        # 映射并激活
+        raw_rgb = self.rgb_dense(combined_feature)
+        rgb = torch.sigmoid(raw_rgb) # 映射到 [0, 1] 空间
+
+        # 7. 恢复维度并返回
+        rgb = rgb.reshape(B, n_rays, -1)
+        attn_weights = attn_weights.reshape(B, n_rays, N, 1)
+
+        return rgb, attn_weights
+    def _overlap_color(self, projected_rgb_and_feat, n_attn):
+        """基于注意力权重计算重叠颜色。"""
+        projected_rgb = projected_rgb_and_feat[..., -3:] # [B, N, n_rays, 3]
+        rgb_overlap = (projected_rgb * n_attn).sum(dim=1) # [B, n_rays, 3]
+        return rgb_overlap
+
 
     def forward(self, batch):
-        batch_rays = batch['target_view_rays'] 
-        
-        # 1. Epipolar Projection
-        projected_coordinates, valid_mask, wcoords = self.projector.epipolar_projection(
-            batch_rays.origins, batch_rays.directions, 
-            batch['ref_worldtocamera'], batch['intrinsic_matrix']
-        )
-        
-        # 2. Get RGB/Features
-        ref_images = batch['ref_images']
-        projected_rgb_and_feat = self._get_pixel_projection(projected_coordinates, ref_images)
-        
-        # 3. Encoding (Mocked for structure)
-        # ...
-        
-        # 4. Transformers & Prediction
-        # ...
-        
-        # Return format matching original
-        ret = []
-        return ret
+        """前向传播逻辑。"""
+        # 1. 解包数据
+        target_rays_o = batch['gt_rays_o']  # [B, n_rays, 3]
+        target_rays_d = batch['gt_rays_d']  # [B, n_rays, 3]
+        ref_images = batch['occ_rgb']       # [B, N, 3, H, W]
+        sampling_grid = batch['sampling_grid'] # [B, N, n_rays, 2]
+        ref_rays_o = batch['occ_rays_o']    # [B, N, n_rays, 3]
+        ref_rays_d = batch['occ_rays_d']    # [B, N, n_rays, 3]
+        pts_3d = batch['pts_3d']        # [B, n_rays, 3]
+        K = batch['K']                    # [B, 3, 3]
+
+        # 2. Query 编码 (目标光线)
+        input_q = self._get_query(target_rays_o, target_rays_d) # [B, n_rays, q_dim]
+
+        # 3. Key 编码 (参考图像采样 + 参考光线方向)
+        # 采样颜色和cnn特征 # [B, N, n_rays, feat_dim]
+        projected_rgb_and_feat = self._get_pixel_projection(sampling_grid,
+                                                    ref_images)
+        input_k, learned_embed = self._get_key(projected_rgb_and_feat,ref_rays_o, ref_rays_d, pts_3d) # [B, N, n_rays, k_dim]
+
+        rgb,n_attn= self._predict_color(input_q, input_k)
+
+        rgb_overlap = self._overlap_color(projected_rgb_and_feat, n_attn)
+        return rgb, rgb_overlap, n_attn, learned_embed
 

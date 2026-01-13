@@ -82,16 +82,37 @@ class LFDataset(Dataset):
                 }
 
             else:
-                # Validation/Test logic (To be implemented later or use full image)
-                 batch = {
-                    'gt_rgb': gt_rgb.permute(2, 0, 1),
-                    'gt_pose': gt_pose,
-                    'gt_depth': gt_depth,
-                    'occ_rgb': occ_rgb.permute(0, 3, 1, 2),
-                    'occ_poses': occ_poses,
-                    'view_rgb': torch.from_numpy(f['occ_center/rgb'][:]).permute(2, 0, 1).float() / 255.0,
+                # Validation/Test logic: Use full image
+                total_pixels = H * W
+                
+                # --- All Pixels Grid ---
+                pixel_coords = torch.stack(torch.meshgrid(
+                    torch.arange(W), torch.arange(H), indexing='xy'
+                ), dim=-1).reshape(-1, 2).float() # [H*W, 2]
+                
+                # --- GT Information ---
+                # Full Pixel Depth for projection
+                flat_depth = gt_depth.reshape(-1)
+                
+                # Compute 3D points and sampling grid for all pixels
+                pts_3d = compute_pts3d(H, W, K, gt_pose, flat_depth, coords=pixel_coords) # [H*W, 3]
+                sampling_grid = get_sampling_grid(pts_3d, occ_poses, K, H, W) # [N, H*W, 2]
+                
+                # Compute ray directions for target view (for view-dependent effects)
+                # Note: Not necessarily needed for now but good to have
+                _, gt_rays_d = generate_rays(H, W, K, gt_pose, coords=pixel_coords)
+
+                batch = {
+                    'gt_rgb': gt_rgb.reshape(-1, 3), # [H*W, 3]
+                    'gt_rays_d': gt_rays_d,          # [H*W, 3]
+                    'H': H,
+                    'W': W,
+                    
+                    # Ref Inputs
+                    'occ_rgb': occ_rgb.permute(0, 3, 1, 2), # [N, 3, H, W]
+                    'sampling_grid': sampling_grid,
                     'K': K
-                 }
+                }
             
         return batch
 
