@@ -59,40 +59,7 @@ class LFModule(L.LightningModule):
         """验证步骤 (通常渲染全图)"""
         # 前向传播
         # 在验证阶段，我们可能只关心最终的 pred_rgb
-        outputs = self(batch)
-        if isinstance(outputs, tuple):
-            pred_rgb = outputs[0]
-        else:
-            pred_rgb = outputs
-            
-        gt_rgb = batch['gt_rgb'] # [B, H*W, 3]
-        
-        # 计算 PSNR 基础指标
-        psnr_val = self.psnr(pred_rgb.clamp(0, 1), gt_rgb.clamp(0, 1))
-        self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True, sync_dist=True)
-
-        # 记录图像可视化 (仅记录 batch 中的第一张)
-        if batch_idx == 0:
-            # 这里的 H, W 需要在 Dataset 提供并在 batch 中带上
-            H, W = batch['H'][0].item(), batch['W'][0].item()
-            
-            # Reshape: [B=1, H*W, 3] -> [3, H, W]
-            p_img = pred_rgb[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1)
-            g_img = gt_rgb[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1)
-            
-            # 计算图像级指标
-            ssim_val = self.ssim(p_img.unsqueeze(0), g_img.unsqueeze(0))
-            # LPIPS 需要 [-1, 1] 范围输入
-            lpips_val = self.lpips_loss(p_img.unsqueeze(0)*2-1, g_img.unsqueeze(0)*2-1).mean()
-            
-            self.log('val/ssim', ssim_val, on_epoch=True)
-            self.log('val/lpips', lpips_val, on_epoch=True)
-
-            # 写入 TensorBoard
-            self.logger.experiment.add_image('val/prediction', p_img, self.global_step)
-            self.logger.experiment.add_image('val/ground_truth', g_img, self.global_step)
-            
-        return psnr_val
+        pass
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
@@ -133,8 +100,7 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config()
-    mode = "fix_line" # mode =[fix_line,rot_arc,rot_line]
-    
+    mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
     # 1. 初始化模型包装器
     model = LFModule(config=config, n_rays=config.train.num_rays)
     
@@ -164,8 +130,8 @@ if __name__ == "__main__":
             ),
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
-        log_every_n_steps=20,
-        check_val_every_n_epoch=5, # 减少验证频率
+        log_every_n_steps=5,
+        check_val_every_n_epoch=5, 
     )
 
 

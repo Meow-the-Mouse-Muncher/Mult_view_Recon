@@ -68,8 +68,8 @@ def get_model_config():
             "layers": 8,
             "heads": 4,
             "embed_dim": 256,
-            "key_dim": 256,
-            "query_dim": 256,
+            "key_dim": 130,
+            "query_dim": 36,
             "mlp_dim": 256
         },
         "cnn": {
@@ -78,7 +78,7 @@ def get_model_config():
             "ksize": 3,
             "use_learned_embedding": True,
             "embedding_dim": 32,
-            "num_train_views": 3
+            "num_train_views": 32
         }
     }
 

@@ -1,7 +1,7 @@
 import h5py
 import os
 
-h5_path = 'data_2/fix_line/scene_007_Target_009_height_100_ang_240.h5'
+h5_path = 'data/fix_line/scene_007_Target_009_height_100_ang_240.h5'
 
 def format_size(size_bytes):
     """自动选择合适的单位"""

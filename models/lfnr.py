@@ -43,11 +43,11 @@ class LFNR(nn.Module):
         self.view_transformer = transformer.SelfAttentionTransformer(self.m_config.view_transformer)
         
         # 后续层使用点号访问对应配置
-        self.view_correspondence = nn.Linear(self.m_config.view_transformer.embed_dim, 1)
+        self.view_correspondence = nn.Linear(self.m_config.view_transformer.embed_dim*2, 1)
         self.rgb_dense = nn.Linear(self.m_config.view_transformer.embed_dim, self.m_config.num_rgb_channels)
         
         # Transforms for Query/Key mapping
-        self.key_transform = nn.Linear(self.m_config.epipolar_transformer.key_dim, self.m_config.epipolar_transformer.embed_dim)   
+        self.key_transform = nn.Linear(self.m_config.view_transformer.key_dim, self.m_config.view_transformer.embed_dim)   
         self.query_transform = nn.Linear(self.m_config.view_transformer.query_dim, self.m_config.view_transformer.embed_dim)
         
         if self.cnn_config.use_learned_embedding:
@@ -73,10 +73,10 @@ class LFNR(nn.Module):
         """参考视角下的 光场编码特征||世界坐标编码||rgb和cnn特征||相机嵌入特征 """
         B, N, n_rays, _ = projected_rgb_and_feat.shape
 
-        # 1. 光场编码 (针对参考光线): [B, N, n_rays, D_lf]
+        # 1. 光场编码 (针对参考光线): [B, N, n_rays, D_lf] D_lf=36
         _, k_enc, _ = self.lightfield.get_lf_encoding(ref_rays_o, ref_rays_d)
 
-        # 2. 3D 点地理位置编码: [B, n_rays, D_w]
+        # 2. 3D 点地理位置编码: [B, n_rays, D_w] D_w=27
         wcoords_enc_raw = lf_utils.posenc(
             pts_3d,
             self.lf_config.min_deg_point,
@@ -121,7 +121,7 @@ class LFNR(nn.Module):
 
         # 2. 提取并采样 CNN 特征
         if self.cnn_config.use_conv_features:
-            ref_features = self.feature_activation(self.conv_layer(ref_images_flat))
+            ref_features = self.feature_activation(self.conv_layer(ref_images_flat)) #[B*N, feat_dim, H, W]
             projected_features = F.grid_sample(ref_features, grid_flat, align_corners=True, mode='bilinear')
             projected_features = projected_features.squeeze(-1).permute(0, 2, 1) # [B*N, n_rays, feat_dim]
             out = torch.cat([projected_features, projected_rgb], dim=-1)
@@ -141,38 +141,48 @@ class LFNR(nn.Module):
         """
         B, N, n_rays, _ = input_k.shape
         
-        q = self.query_transform(input_q)
-        k = self.key_transform(input_k)
+        # 1. 投影到统一的嵌入空间
+        # q: [B, n_rays, q_dim] -> [B, n_rays, 1, embed_dim] -> [(B*n_rays), 1, embed_dim]
+        q = self.query_transform(input_q).unsqueeze(2).reshape(B * n_rays, 1, -1)
+        
+        # k: [B, N, n_rays, k_dim] -> [B, n_rays, N, k_dim] -> [(B*n_rays), N, embed_dim]
+        # 注意这里要先 permute 把视角维度 N 换到最后，然后再投影和 reshape
+        k = input_k.permute(0, 2, 1, 3).reshape(B * n_rays, N, -1)
+        k = self.key_transform(k) # [(B*n_rays), N, embed_dim]
+        
+        # 2. 现在 q 和 k 都是 3D 张量且维度匹配了
+        # q_k_combined: [(B*n_rays), (1 + N), embed_dim]
         q_k_combined = torch.cat([q, k], dim=1)
-        out = self.view_transformer(q_k_combined)
+
+        # 3. 通过 View Transformer
+        out = self.view_transformer(q_k_combined) # [(B*n_rays), 1+N, embed_dim]
 
         # 4. 分离更新后的 Query 和 Keys
-        refined_query = out[:, 0:1, :]        
-        refined_key = out[:, 1:, :]             
+        refined_query = out[:, 0:1, :]           # [(B*n_rays), 1, embed_dim]
+        refined_key = out[:, 1:, :]             # [(B*n_rays), N, embed_dim]
 
-        # 5. 计算视角间的注意力权重 (Cross-view Correlation)
+        # 5. 计算注意力权重
+        # 扩展 Query 以对齐每个 Key: [(B*n_rays), N, embed_dim]
         refined_query_expanded = refined_query.expand(-1, N, -1)
+        concat_feat = torch.cat([refined_query_expanded, refined_key], dim=-1)
         
-        # 拼接做相关性计算
-        concat_feat = torch.cat([refined_query_expanded, refined_key], dim=-1) # [..., N, embed_dim*2]
-        
-        # 计算权重并 Softmax
-        attn_weights = self.view_correspondence(concat_feat) # [B*n_rays, N, 1]
-        attn_weights = F.softmax(attn_weights, dim=1)        # 在 N 维度做归一化
+        # attn_weights: [(B*n_rays), N, 1]
+        attn_weights = self.view_correspondence(concat_feat)
+        attn_weights = F.softmax(attn_weights, dim=1)
 
-        # 6. 加权聚合特征并映射为 RGB
-        # 加权平均后的特征: [B*n_rays, embed_dim]
+        # 6. 聚合特征并生成颜色
+        # combined_feature: [(B*n_rays), embed_dim]
         combined_feature = (refined_key * attn_weights).sum(dim=1)
         
-        # 映射并激活
-        raw_rgb = self.rgb_dense(combined_feature)
-        rgb = torch.sigmoid(raw_rgb) # 映射到 [0, 1] 空间
+        # 恢复到原始 batch 形状并激活
+        raw_rgb = self.rgb_dense(combined_feature) # [(B*n_rays), 3]
+        rgb = torch.sigmoid(raw_rgb).reshape(B, n_rays, 3) 
 
-        # 7. 恢复维度并返回
-        rgb = rgb.reshape(B, n_rays, -1)
-        attn_weights = attn_weights.reshape(B, n_rays, N, 1)
+        # 恢复权重形状以供后续使用
+        attn_weights = attn_weights.reshape(B, n_rays, N, 1).permute(0, 2, 1, 3) # [B, N, n_rays, 1]
 
         return rgb, attn_weights
+
     def _overlap_color(self, projected_rgb_and_feat, n_attn):
         """基于注意力权重计算重叠颜色。"""
         projected_rgb = projected_rgb_and_feat[..., -3:] # [B, N, n_rays, 3]
@@ -192,14 +202,14 @@ class LFNR(nn.Module):
         pts_3d = batch['pts_3d']        # [B, n_rays, 3]
         K = batch['K']                    # [B, 3, 3]
 
-        # 2. Query 编码 (目标光线)
+        # 2. Query 编码 (目标光线) q_dim = 36
         input_q = self._get_query(target_rays_o, target_rays_d) # [B, n_rays, q_dim]
 
         # 3. Key 编码 (参考图像采样 + 参考光线方向)
-        # 采样颜色和cnn特征 # [B, N, n_rays, feat_dim]
+        # 采样颜色和cnn特征 # [B, N, n_rays, feat_dim] feat_dim=35
         projected_rgb_and_feat = self._get_pixel_projection(sampling_grid,
                                                     ref_images)
-        input_k, learned_embed = self._get_key(projected_rgb_and_feat,ref_rays_o, ref_rays_d, pts_3d) # [B, N, n_rays, k_dim]
+        input_k, learned_embed = self._get_key(projected_rgb_and_feat,ref_rays_o, ref_rays_d, pts_3d) # [B, N, n_rays, k_dim] k_dim=130
 
         rgb,n_attn= self._predict_color(input_q, input_k)
 
