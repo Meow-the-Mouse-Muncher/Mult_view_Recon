@@ -7,6 +7,8 @@ from dataset.LF_dataset import LFDataModule
 from configs.config import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+import h5py # 确保顶部导入
+torch.set_float32_matmul_precision('high')
 
 class LFModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 LFNR。"""
@@ -23,9 +25,14 @@ class LFModule(L.LightningModule):
         # 损失函数
         self.mse_loss = nn.MSELoss()
         
-        # 指标
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
+        # 指标初始化
+        metrics_kwargs = {"data_range": 1.0}
+        self.psnr = PeakSignalNoiseRatio(**metrics_kwargs)
+        self.ssim = StructuralSimilarityIndexMeasure(**metrics_kwargs)
+        
+        # [新增] 验证集结果缓存
+        # 结构: { file_idx: { 'preds': [], 'gts': [], 'center': ... } }
+        self.val_outputs = {}
 
     def forward(self, batch):
         return self.model.forward(batch)
@@ -53,84 +60,107 @@ class LFModule(L.LightningModule):
             
         return loss
 
+    # === DDP 兼容的验证逻辑 ===
+    
+    def on_validation_epoch_start(self):
+        # 改用列表存储，方便 stack
+        self.val_step_outputs = [] 
+
     def validation_step(self, batch, batch_idx):
-        pass
-        # """验证步骤 (通常渲染全图)"""
-        # # Batch Size 在验证时应该为 1，因为全图光线 H*W 很大
-        # # batch['gt_rgb']: [1, H*W, 3]
+        pred_chunk, _ = self(batch)
+        # 仅收集预测、GT和索引，不收集 Center 图
+        self.val_step_outputs.append({
+            'pred': pred_chunk.detach(),
+            'gt': batch['gt_rgb'].detach(),
+            'file_idx': batch['meta_file_idx'],
+            'start_idx': batch['meta_start']
+        })
+
+    def on_validation_epoch_end(self):
+        """
+        全卡收集 -> CPU 拼图 -> 计算指标 -> 可视化
+        """
         
-        # # 1. 前向传播 (Chunking 处理以防 OOM)
-        # # 注意：由于 sampling_grid 已经是 [1, N, H*W, 2]，我们需要对 rays 和 grid 进行切片
-        # chunk_size = 2048 # 强行改小试试，原先可能是 8192 太大了
-        # view_img = batch['occ_center_rgb'] 
-        # B, total_pixels, _ = batch['gt_rgb'].shape
-        # assert B == 1, "验证/测试时 Batch Size 必须为 1"
-        
-        # all_pred_rgb = []
-        
-        # # 逐块进行推理
-        # for i in range(0, total_pixels, chunk_size):
-        #     end = min(i + chunk_size, total_pixels)
+        # [修复] 如果是在进行 Sanity Check (只跑几个 batch), 数据肯定不全
+        # 此时强制跳过繁重的拼图和可视化逻辑
+        if self.trainer.sanity_checking:
+            self.val_step_outputs.clear()
+            return
             
-        #     # 构建一个 mini-batch 字典
-        #     chunk_batch = {
-        #         # [1, chunk, 3]
-        #         'gt_rays_o': batch['gt_rays_o'][:, i:end, :],
-        #         'gt_rays_d': batch['gt_rays_d'][:, i:end, :],
-        #         'pts_3d':    batch['pts_3d'][:, i:end, :],
+        # 1. 在单卡内部 Stack 起来
+        if not self.val_step_outputs: return
+        
+        # 1. DDP 收集
+        local_preds = torch.cat([x['pred'] for x in self.val_step_outputs], dim=0)
+        local_gts = torch.cat([x['gt'] for x in self.val_step_outputs], dim=0)
+        local_fidxs = torch.cat([x['file_idx'] for x in self.val_step_outputs], dim=0)
+        local_starts = torch.cat([x['start_idx'] for x in self.val_step_outputs], dim=0)
+        
+        global_preds = self.all_gather(local_preds).view(-1, local_preds.shape[1], 3).cpu()
+        global_gts = self.all_gather(local_gts).view(-1, local_gts.shape[1], 3).cpu()
+        global_fidxs = self.all_gather(local_fidxs).view(-1).cpu()
+        global_starts = self.all_gather(local_starts).view(-1).cpu()
+
+        # 2. 仅在 Rank 0 拼图、计算指标和可视化
+        if self.global_rank == 0:
+            val_h5_files = self.trainer.datamodule.val_dataset.h5_files
+            unique_files = torch.unique(global_fidxs)
+            
+            # [新增] 累加器
+            total_psnr = 0.0
+            total_ssim = 0.0
+            num_images = 0
+
+            for fid in unique_files:
+                if fid < 0: continue
+                mask = (global_fidxs == fid)
                 
-        #         # 参考信息部分
-        #         'occ_rgb': batch['occ_rgb'], 
-
-        #         # grid and rays need slicing
-        #         'sampling_grid': batch['sampling_grid'][:, :, i:end, :],
-        #         'occ_rays_d':    batch['occ_rays_d'][:, :, i:end, :],
-        #         'occ_rays_o':    batch['occ_rays_o'][:, :, i:end, :]
-        #     }
-            
-        #     # 预测
-        #     with torch.no_grad():
-        #         pred_chunk = self(chunk_batch)[0] 
-        #         # 关键修改：立即由 GPU 转存到 CPU，腾出显存给下一块
-        #         all_pred_rgb.append(pred_chunk.cpu()) 
+                # 拼图逻辑
+                sort_idx = torch.argsort(global_starts[mask])
+                img_p = global_preds[mask][sort_idx].reshape(-1, 3)
+                img_g = global_gts[mask][sort_idx].reshape(-1, 3)
                 
-        # # 拼接结果 (在 CPU 上进行)
-        # pred_rgb = torch.cat(all_pred_rgb, dim=1).to(self.device) # 如果需要计算 loss 再转回去，或者直接在 CPU 算 PSNR
-        
-        # # 优化：为了计算 PSNR，把 gt_rgb 也转到 CPU 算，彻底省显存
-        # gt_rgb_cpu = batch['gt_rgb'].cpu()
-        # pred_rgb_cpu = torch.cat(all_pred_rgb, dim=1) # 已经在 CPU 上了
-        
-        # # 2. 计算 PSNR (推荐使用 torchmetrics 的函数式接口，或者临时新建对象，避免设备冲突)
-        # # 方式 A: 直接手动计算 MSE 转 PSNR (最快，无依赖)
-        # mse = torch.mean((pred_rgb_cpu.clamp(0, 1) - gt_rgb_cpu.clamp(0, 1)) ** 2)
-        # psnr_val = -10.0 * torch.log10(mse)
-        
-        # self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True, sync_dist=True)
-
-        # # 3. 记录第一张图像 (仅在 batch_idx == 0 时执行)
-        # if batch_idx == 0:
-        #     H, W = batch['H'].item(), batch['W'].item()
+                H = int(img_p.shape[0]**0.5)
+                if H*H != img_p.shape[0]: continue
+                
+                # 转换为图像维度 [1, 3, H, W]
+                view_p = img_p.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1).to(self.device)
+                view_g = img_g.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1).to(self.device)
+                
+                # === [新增] 计算单张图的指标 ===
+                cur_psnr = self.psnr(view_p, view_g)
+                cur_ssim = self.ssim(view_p, view_g)
+                
+                total_psnr += cur_psnr
+                total_ssim += cur_ssim
+                num_images += 1
+                
+                # 可视化第一张图
+                if num_images == 1:
+                    h5_path = val_h5_files[fid]
+                    with h5py.File(h5_path, 'r') as f:
+                        center_img = torch.from_numpy(f['occ_center/rgb'][:]).float() / 255.0
+                        center_view = center_img.permute(2, 0, 1).unsqueeze(0).to(self.device)
+                    
+                    if center_view.shape[2:] != view_p.shape[2:]:
+                        print(f"[Warning] Skip Vis: Shape mismatch Ref{center_view.shape} vs Pred{view_p.shape}")
+                    else:
+                        grid = torch.cat([center_view, view_p, view_g], dim=3)
+                        self.logger.experiment.add_image('val/Comparison', grid[0], self.global_step)
             
-        #     # 准备图像数据: [1, 3, H, W]
-        #     # 一张图显存占用很小，不会 OOM
-        #     p_img_gpu = pred_rgb_cpu[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1).unsqueeze(0).to(self.device)
-        #     g_img_gpu = gt_rgb_cpu[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1).unsqueeze(0).to(self.device)
-        #     c_img_gpu = batch['occ_center_rgb'].to(self.device)
-        #     # 确保维度一致 (有时 center 图可能是 [B, H, W, 3] 或者没有 batch 维)
-        #     if c_img_gpu.ndim == 3: c_img_gpu = c_img_gpu.unsqueeze(0)
-        #     if c_img_gpu.shape[-1] == 3: c_img_gpu = c_img_gpu.permute(0, 3, 1, 2) # [1, 3, H, W]
-            
-        #     # 使用 self.ssim (在 GPU) 计算
-        #     ssim_val = self.ssim(p_img_gpu, g_img_gpu)
-        #     self.log('val/ssim', ssim_val, on_epoch=True)
-        #     concat_img = torch.cat([c_img_gpu, p_img_gpu, g_img_gpu], dim=3)
+            # === [新增] 记录平均指标 ===
+            if num_images > 0:
+                avg_psnr = total_psnr / num_images
+                avg_ssim = total_ssim / num_images
+                # rank_zero_only=True 避免多卡重复记录
+                self.log('val/psnr', avg_psnr, rank_zero_only=True)
+                self.log('val/ssim', avg_ssim, rank_zero_only=True)
 
-        #     # TensorBoard 记录 (不需要 GPU，取回 CPU)
-        #     self.logger.experiment.add_image('val/View_Pred_GT', concat_img[0].cpu(), self.global_step)
-            
-        # return psnr_val
+        # 清空
+        self.val_step_outputs.clear()
 
+    # === 验证逻辑结束 ===
+    
     def test_step(self, batch, batch_idx):
         """测试步骤（逻辑同 Val）"""
         return self.validation_step(batch, batch_idx)
@@ -207,9 +237,10 @@ if __name__ == "__main__":
     dm = LFDataModule(
         data_dir="data",
         model=mode,
-        batch_size=1, # 单个gpu上的batch size
+        batch_size=1,
         num_workers=4,
-        n_rays=config.train.num_rays
+        n_rays=config.train.num_rays,
+        val_chunk_size=config.eval.chunk 
     )
 
     # 创建 Trainer
@@ -231,7 +262,7 @@ if __name__ == "__main__":
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
         log_every_n_steps=20,
-        check_val_every_n_epoch=5, 
+        check_val_every_n_epoch=1, 
     )
 
 

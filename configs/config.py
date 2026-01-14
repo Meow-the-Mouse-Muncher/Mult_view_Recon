@@ -115,7 +115,7 @@ def get_eval_config():
     return {
         "eval_once": False,
         "save_output": True,
-        "chunk": 8192,
+        "chunk": 4096,
         "inference": False
     }
 
