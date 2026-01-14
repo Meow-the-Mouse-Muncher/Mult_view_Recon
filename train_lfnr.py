@@ -175,20 +175,20 @@ class LFModule(L.LightningModule):
             eps=1e-9
         )
         
-        warmup_epochs = self.config.train.warmup_epochs
-        max_epochs = self.config.train.num_epochs
+        warmup_steps = self.config.train.warmup_steps
+        max_steps = self.config.train.max_steps
         
-        # 1. 线性预热调度器: 在 warmup_epochs 内从 lr_init * 0.01 增加到 lr_init
+        # 1. 线性预热调度器: 在 warmup_steps 内从 lr_init * 0.01 增加到 lr_init
         scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, 
             start_factor=0.01, 
-            total_iters=warmup_epochs
+            total_iters=warmup_steps
         )
         
-        # 2. 余弦退火调度器: 从 warmup_epochs 开始，在剩余步数内降至 lr_final
+        # 2. 余弦退火调度器: 从 warmup_steps 开始，在剩余步数内降至 lr_final
         scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, 
-            T_max=max_epochs - warmup_epochs,
+            T_max=max_steps - warmup_steps,
             eta_min=self.config.train.lr_final
         )
         
@@ -196,14 +196,14 @@ class LFModule(L.LightningModule):
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[scheduler_warmup, scheduler_cosine],
-            milestones=[warmup_epochs]
+            milestones=[warmup_steps]
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch", # 关键：设置为按 epoch 更新
+                "interval": "step", # 关键：设置为按 step 更新
             },
         }
 
@@ -245,7 +245,7 @@ if __name__ == "__main__":
 
     # 创建 Trainer
     trainer = L.Trainer(
-        max_epochs=config.train.num_epochs,
+        max_steps=config.train.max_steps,
         accelerator="gpu",
         devices=2,  
         strategy="ddp",
