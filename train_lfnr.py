@@ -2,7 +2,6 @@ import os
 import torch
 import lightning as L
 from torch import nn
-import lpips
 from models.lfnr import LFNR
 from dataset.LF_dataset import LFDataModule
 from configs.config import get_config
@@ -23,7 +22,6 @@ class LFModule(L.LightningModule):
         
         # 损失函数
         self.mse_loss = nn.MSELoss()
-        self.lpips_loss = lpips.LPIPS(net='vgg')
         
         # 指标
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -35,8 +33,8 @@ class LFModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         """训练步骤 (Sparse Ray Training)"""
         # 1. 前向传播
-        # 返回值: 预测RGB, 重叠区RGB(如有), 注意力权重, 学习到的相机嵌入
-        pred_rgb, rgb_overlap, attn_weights, learned_embed = self(batch)
+        # 返回值: 预测RGB, 重叠区RGB(如有)
+        pred_rgb, rgb_overlap = self(batch)
         gt_rgb = batch['gt_rgb'] # [B, n_rays, 3]
         
         # 2. 计算损耗
@@ -49,26 +47,93 @@ class LFModule(L.LightningModule):
         loss = loss_pred + loss_overlap
         
         # 3. 记录日志
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('train/loss_pred', loss_pred, on_step=True, on_epoch=True, sync_dist=True)
-        self.log('train/loss_overlap', loss_overlap, on_step=True, on_epoch=True, sync_dist=True)
+        self.log('train/loss', loss, prog_bar=True, sync_dist=True)
+        self.log('train/loss_pred', loss_pred, sync_dist=True)
+        self.log('train/loss_overlap', loss_overlap, sync_dist=True)
             
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证步骤 (通常渲染全图)"""
-        # 前向传播
-        # 在验证阶段，我们可能只关心最终的 pred_rgb
         pass
+        # """验证步骤 (通常渲染全图)"""
+        # # Batch Size 在验证时应该为 1，因为全图光线 H*W 很大
+        # # batch['gt_rgb']: [1, H*W, 3]
+        
+        # # 1. 前向传播 (Chunking 处理以防 OOM)
+        # # 注意：由于 sampling_grid 已经是 [1, N, H*W, 2]，我们需要对 rays 和 grid 进行切片
+        # chunk_size = 2048 # 强行改小试试，原先可能是 8192 太大了
+        # view_img = batch['occ_center_rgb'] 
+        # B, total_pixels, _ = batch['gt_rgb'].shape
+        # assert B == 1, "验证/测试时 Batch Size 必须为 1"
+        
+        # all_pred_rgb = []
+        
+        # # 逐块进行推理
+        # for i in range(0, total_pixels, chunk_size):
+        #     end = min(i + chunk_size, total_pixels)
+            
+        #     # 构建一个 mini-batch 字典
+        #     chunk_batch = {
+        #         # [1, chunk, 3]
+        #         'gt_rays_o': batch['gt_rays_o'][:, i:end, :],
+        #         'gt_rays_d': batch['gt_rays_d'][:, i:end, :],
+        #         'pts_3d':    batch['pts_3d'][:, i:end, :],
+                
+        #         # 参考信息部分
+        #         'occ_rgb': batch['occ_rgb'], 
+
+        #         # grid and rays need slicing
+        #         'sampling_grid': batch['sampling_grid'][:, :, i:end, :],
+        #         'occ_rays_d':    batch['occ_rays_d'][:, :, i:end, :],
+        #         'occ_rays_o':    batch['occ_rays_o'][:, :, i:end, :]
+        #     }
+            
+        #     # 预测
+        #     with torch.no_grad():
+        #         pred_chunk = self(chunk_batch)[0] 
+        #         # 关键修改：立即由 GPU 转存到 CPU，腾出显存给下一块
+        #         all_pred_rgb.append(pred_chunk.cpu()) 
+                
+        # # 拼接结果 (在 CPU 上进行)
+        # pred_rgb = torch.cat(all_pred_rgb, dim=1).to(self.device) # 如果需要计算 loss 再转回去，或者直接在 CPU 算 PSNR
+        
+        # # 优化：为了计算 PSNR，把 gt_rgb 也转到 CPU 算，彻底省显存
+        # gt_rgb_cpu = batch['gt_rgb'].cpu()
+        # pred_rgb_cpu = torch.cat(all_pred_rgb, dim=1) # 已经在 CPU 上了
+        
+        # # 2. 计算 PSNR (推荐使用 torchmetrics 的函数式接口，或者临时新建对象，避免设备冲突)
+        # # 方式 A: 直接手动计算 MSE 转 PSNR (最快，无依赖)
+        # mse = torch.mean((pred_rgb_cpu.clamp(0, 1) - gt_rgb_cpu.clamp(0, 1)) ** 2)
+        # psnr_val = -10.0 * torch.log10(mse)
+        
+        # self.log('val/psnr', psnr_val, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # # 3. 记录第一张图像 (仅在 batch_idx == 0 时执行)
+        # if batch_idx == 0:
+        #     H, W = batch['H'].item(), batch['W'].item()
+            
+        #     # 准备图像数据: [1, 3, H, W]
+        #     # 一张图显存占用很小，不会 OOM
+        #     p_img_gpu = pred_rgb_cpu[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1).unsqueeze(0).to(self.device)
+        #     g_img_gpu = gt_rgb_cpu[0].view(H, W, 3).permute(2, 0, 1).clamp(0, 1).unsqueeze(0).to(self.device)
+        #     c_img_gpu = batch['occ_center_rgb'].to(self.device)
+        #     # 确保维度一致 (有时 center 图可能是 [B, H, W, 3] 或者没有 batch 维)
+        #     if c_img_gpu.ndim == 3: c_img_gpu = c_img_gpu.unsqueeze(0)
+        #     if c_img_gpu.shape[-1] == 3: c_img_gpu = c_img_gpu.permute(0, 3, 1, 2) # [1, 3, H, W]
+            
+        #     # 使用 self.ssim (在 GPU) 计算
+        #     ssim_val = self.ssim(p_img_gpu, g_img_gpu)
+        #     self.log('val/ssim', ssim_val, on_epoch=True)
+        #     concat_img = torch.cat([c_img_gpu, p_img_gpu, g_img_gpu], dim=3)
+
+        #     # TensorBoard 记录 (不需要 GPU，取回 CPU)
+        #     self.logger.experiment.add_image('val/View_Pred_GT', concat_img[0].cpu(), self.global_step)
+            
+        # return psnr_val
 
     def test_step(self, batch, batch_idx):
-        """测试步骤"""
-        pred_rgb = self(batch)
-        gt_rgb = batch['gt_rgb']
-        
-        psnr_val = self.psnr(pred_rgb, gt_rgb)
-        self.log('test/psnr', psnr_val, on_epoch=True)
-        return psnr_val
+        """测试步骤（逻辑同 Val）"""
+        return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -95,6 +160,23 @@ class LFModule(L.LightningModule):
             },
         }
 
+    # def on_after_backward(self):
+    #     # 仅在训练的第一步运行一次检查
+    #     if self.global_step == 0:
+    #         print("\n" + "="*50)
+    #         print("正在检测未使用的模型参数 (grad is None):")
+    #         unused_params = []
+    #         for name, param in self.named_parameters():
+    #             if param.grad is None:
+    #                 unused_params.append(name)
+    #                 print(f"🚩 未使用的参数: {name}")
+            
+    #         if not unused_params:
+    #             print("✅ 完美！所有参数都参与了梯度计算。")
+    #         else:
+    #             print(f"\n共发现 {len(unused_params)} 个未使用的参数。")
+    #         print("="*50 + "\n")
+
 if __name__ == "__main__":
     print("=== 开始训练 LFNR 模型 ===")
     
@@ -108,8 +190,8 @@ if __name__ == "__main__":
     dm = LFDataModule(
         data_dir="data",
         model=mode,
-        batch_size=1, # 训练时每个 batch 包含 N_rays，所以 batch_size 设为 1 即可
-        num_workers=8,
+        batch_size=1, # 单个gpu上的batch size
+        num_workers=4,
         n_rays=config.train.num_rays
     )
 
@@ -117,20 +199,21 @@ if __name__ == "__main__":
     trainer = L.Trainer(
         max_epochs=config.train.num_epochs,
         accelerator="gpu",
-        devices=[0],  
-        strategy="auto",
+        devices=2,  
+        strategy="ddp",
         logger=TensorBoardLogger("logs", name=mode, version=None), 
         callbacks=[
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
                 filename="lfnr-{epoch:02d}",
-                monitor="val/psnr",
-                mode="max",
+                monitor="epoch",  # 监控 epoch 数量
+                mode="max",       # 保存 epoch 最大的（也就是最新的）
                 save_top_k=4,
+                every_n_epochs=5
             ),
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
-        log_every_n_steps=5,
+        log_every_n_steps=20,
         check_val_every_n_epoch=5, 
     )
 

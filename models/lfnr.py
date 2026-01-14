@@ -105,7 +105,7 @@ class LFNR(nn.Module):
             learned_embed
         ], dim=-1)
 
-        return input_k,learned_embed
+        return input_k
 
     def _get_pixel_projection(self, sampling_grid, ref_images):
         """
@@ -200,7 +200,6 @@ class LFNR(nn.Module):
         ref_rays_o = batch['occ_rays_o']    # [B, N, n_rays, 3]
         ref_rays_d = batch['occ_rays_d']    # [B, N, n_rays, 3]
         pts_3d = batch['pts_3d']        # [B, n_rays, 3]
-        K = batch['K']                    # [B, 3, 3]
 
         # 2. Query 编码 (目标光线) q_dim = 36
         input_q = self._get_query(target_rays_o, target_rays_d) # [B, n_rays, q_dim]
@@ -209,10 +208,10 @@ class LFNR(nn.Module):
         # 采样颜色和cnn特征 # [B, N, n_rays, feat_dim] feat_dim=35
         projected_rgb_and_feat = self._get_pixel_projection(sampling_grid,
                                                     ref_images)
-        input_k, learned_embed = self._get_key(projected_rgb_and_feat,ref_rays_o, ref_rays_d, pts_3d) # [B, N, n_rays, k_dim] k_dim=130
+        input_k = self._get_key(projected_rgb_and_feat,ref_rays_o, ref_rays_d, pts_3d) # [B, N, n_rays, k_dim] k_dim=130
 
         rgb,n_attn= self._predict_color(input_q, input_k)
 
         rgb_overlap = self._overlap_color(projected_rgb_and_feat, n_attn)
-        return rgb, rgb_overlap, n_attn, learned_embed
+        return rgb, rgb_overlap
 

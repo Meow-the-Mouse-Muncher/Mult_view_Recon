@@ -29,7 +29,7 @@ class LFDataset(Dataset):
             # Ref Data
             occ_rgb = torch.from_numpy(f['occ_ref/rgb'][:]).float() / 255.0  # [N, H, W, 3]
             occ_poses = torch.from_numpy(f['occ_ref/poses'][:]).float()      # [N, 4, 4]
-            
+            occ_center_rgb = torch.from_numpy(f['occ_center/rgb'][:]).float() / 255.0 # [H, W, 3] (Not used here)
             # Camera
             K = torch.from_numpy(f['world/K'][:]).float()
             
@@ -83,34 +83,46 @@ class LFDataset(Dataset):
 
             else:
                 # Validation/Test logic: Use full image
-                total_pixels = H * W
+                # 为了防止显存爆炸，我们不在 Dataset 里全图采样，而是只提供必要信息，
+                # 让 Model 在 validation_step 自行分块 (chunk) 处理或全图处理。
+                # 但考虑到逻辑简单性，这里先返回全图采样点，在 LightningModule 做 chunk。
                 
-                # --- All Pixels Grid ---
+                # 生成网格坐标 [H, W, 2] -> [H*W, 2]
                 pixel_coords = torch.stack(torch.meshgrid(
                     torch.arange(W), torch.arange(H), indexing='xy'
                 ), dim=-1).reshape(-1, 2).float() # [H*W, 2]
                 
                 # --- GT Information ---
-                # Full Pixel Depth for projection
-                flat_depth = gt_depth.reshape(-1)
+                flat_depth = gt_depth.reshape(-1) # [H*W]
                 
-                # Compute 3D points and sampling grid for all pixels
+                # 生成射线
+                gt_rays_o, gt_rays_d = generate_rays(H, W, K, gt_pose, coords=pixel_coords) # [H*W, 3]
+                
+                # Compute 3D points
                 pts_3d = compute_pts3d(H, W, K, gt_pose, flat_depth, coords=pixel_coords) # [H*W, 3]
+                
+                # Compute Sampling Grid for Ref Images
                 sampling_grid = get_sampling_grid(pts_3d, occ_poses, K, H, W) # [N, H*W, 2]
                 
-                # Compute ray directions for target view (for view-dependent effects)
-                # Note: Not necessarily needed for now but good to have
-                _, gt_rays_d = generate_rays(H, W, K, gt_pose, coords=pixel_coords)
+                # Ref 几何信息
+                ref_cam_pos = occ_poses[:, :3, 3].unsqueeze(1).expand(-1, H*W, 3) # [N, H*W, 3]
+                diff = pts_3d.unsqueeze(0) - ref_cam_pos 
+                occ_rays_d = torch.nn.functional.normalize(diff, p=2, dim=-1)
 
                 batch = {
-                    'gt_rgb': gt_rgb.reshape(-1, 3), # [H*W, 3]
-                    'gt_rays_d': gt_rays_d,          # [H*W, 3]
-                    'H': H,
-                    'W': W,
+                    'gt_rgb': gt_rgb.reshape(-1, 3),    # [H*W, 3]
+                    'gt_rays_o': gt_rays_o,             # [H*W, 3] (Previously Missing!)
+                    'gt_rays_d': gt_rays_d,             # [H*W, 3] (Previously Missing!)
+                    'pts_3d': pts_3d,                   # [H*W, 3]
                     
-                    # Ref Inputs
+                    'H': torch.tensor(H), # 存为 Tensor 方便 batch 解包
+                    'W': torch.tensor(W),
+                    'occ_center_rgb': occ_center_rgb, # [H, W, 3] (Not used here)
+                    
                     'occ_rgb': occ_rgb.permute(0, 3, 1, 2), # [N, 3, H, W]
-                    'sampling_grid': sampling_grid,
+                    'sampling_grid': sampling_grid,         # [N, H*W, 2]
+                    'occ_rays_o': ref_cam_pos,              # [N, H*W, 3]
+                    'occ_rays_d': occ_rays_d,               # [N, H*W, 3]
                     'K': K
                 }
             
@@ -162,7 +174,7 @@ class LFDataModule(L.LightningDataModule):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        return DataLoader(self.val_dataset, batch_size=1, shuffle=True, num_workers=self.num_workers)
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)

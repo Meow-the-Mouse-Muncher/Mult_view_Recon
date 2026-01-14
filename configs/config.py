@@ -44,16 +44,11 @@ def get_dataset_config():
         "data_dir": "",
         "base_dir": "",
         "scene": "",
-        "batch_size": 16384,
+        "batch_size": 4,
         "batching": "single_image",
-        "factor": 4,
-        "render_path": False,
-        "spherify": False,
-        "llffhold": 8,
         "use_pixel_centers": False,
         "image_height": -1,
         "image_width": -1,
-        "num_train_views": -1,
         "num_interpolation_views": 10
     }
 
