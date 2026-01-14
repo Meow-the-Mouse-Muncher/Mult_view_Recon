@@ -136,27 +136,44 @@ class LFModule(L.LightningModule):
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
-        """配置优化器和学习率调度器"""
+        """配置带线性预热和余弦退火的学习率调度器"""
         optimizer = torch.optim.AdamW(
             self.parameters(), 
             lr=self.config.train.lr_init,
             weight_decay=self.config.train.weight_decay,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.98),
+            eps=1e-9
         )
         
-        # 使用余弦退火学习率调度器
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        warmup_steps = self.config.train.warmup_steps
+        max_steps = self.config.train.max_steps
+        
+        # 1. 线性预热调度器: 在 warmup_steps 内从 lr_init * 0.01 增加到 lr_init
+        scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, 
-            T_max=self.config.train.num_epochs,
+            start_factor=0.01, 
+            total_iters=warmup_steps
+        )
+        
+        # 2. 余弦退火调度器: 从 warmup_steps 开始，在剩余步数内降至 lr_final
+        scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=max_steps - warmup_steps,
             eta_min=self.config.train.lr_final
+        )
+        
+        # 3. 顺序组合调度器
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[scheduler_warmup, scheduler_cosine],
+            milestones=[warmup_steps]
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
-                "frequency": 1,
+                "interval": "step", # 关键：设置为按 step 更新
             },
         }
 
@@ -236,7 +253,7 @@ if __name__ == "__main__":
     # 开始训练 (传入 ckpt_path 参数)
     trainer.fit(model, dm, ckpt_path=last_ckpt)
     
-    # 可选：测试最佳模型
-    trainer.test(model, dm, ckpt_path="best")
+    # # 可选：测试最佳模型
+    # trainer.test(model, dm, ckpt_path="best")
     
     print("=== 训练完成 ===")

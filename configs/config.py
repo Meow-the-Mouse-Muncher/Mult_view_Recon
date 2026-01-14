@@ -84,8 +84,6 @@ def get_lf_config():
         "name": "lightslab",
         "st_plane": 0.5,
         "uv_plane": 1.0,
-        "sphere_radius": 3.0,
-        "sphere_center": [0.0, 0.0, 0.0],
         "encoding_name": "positional_encoding",
         "min_deg_point": 0,
         "max_deg_point": 4
@@ -96,14 +94,13 @@ def get_train_config():
     """训练超参数配置"""
     return {
         "lr_init": 2.0e-3,
-        "warmup_epochs": 2,
         "weight_decay": 0.0,
         "warmup_steps": 2500,
-        "lr_final": 2.0e-5,
+        "lr_final": 1.0e-4,
         "lr_delay_mult": 0.1,
         "grad_max_norm": 0,
         "grad_max_val": 0,
-        "max_steps": 250000,
+        "max_steps": 150000,
         "num_epochs": 180,
         "num_rays": 4096,
         "checkpoint_every_steps": 1000,
