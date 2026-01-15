@@ -7,19 +7,21 @@ from dataset.LF_dataset import LFDataModule
 from configs.config import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-import h5py # 确保顶部导入
+import h5py 
+from torchvision.utils import save_image
+
 torch.set_float32_matmul_precision('high')
 
 class LFModule(L.LightningModule):
     """Lightning 模型包装器，用于训练 LFNR。"""
-    def __init__(self, config, n_rays=4096):
+    def __init__(self, config, n_rays=4096, save_dir="pred_data"):
         super().__init__()
-        # 直接保存整个 config 对象
         self.save_hyperparameters(config)
         self.config = config
         self.n_rays = n_rays
+        self.save_dir = save_dir
         
-        # 初始化模型：仅传一个 config 对象
+        # 初始化模型
         self.model = LFNR(config=config)
         
         # 损失函数
@@ -30,30 +32,21 @@ class LFModule(L.LightningModule):
         self.psnr = PeakSignalNoiseRatio(**metrics_kwargs)
         self.ssim = StructuralSimilarityIndexMeasure(**metrics_kwargs)
         
-        # [新增] 验证集结果缓存
-        # 结构: { file_idx: { 'preds': [], 'gts': [], 'center': ... } }
-        self.val_outputs = {}
+        # 缓存
+        self.val_step_outputs = []
+        self.test_step_outputs = []
 
     def forward(self, batch):
         return self.model.forward(batch)
 
     def training_step(self, batch, batch_idx):
-        """训练步骤 (Sparse Ray Training)"""
-        # 1. 前向传播
-        # 返回值: 预测RGB, 重叠区RGB(如有)
         pred_rgb, rgb_overlap = self(batch)
-        gt_rgb = batch['gt_rgb'] # [B, n_rays, 3]
+        gt_rgb = batch['gt_rgb'] 
         
-        # 2. 计算损耗
-        # 主预测损失
         loss_pred = self.mse_loss(pred_rgb, gt_rgb)
-        
-        # 重叠区域/辅助损失 (如果模型支持)
         loss_overlap = self.mse_loss(rgb_overlap, gt_rgb)
-        # 总损失 (L2权重衰减已在AdamW中处理)
         loss = loss_pred + loss_overlap
         
-        # 3. 记录日志
         self.log('train/loss', loss, prog_bar=True, sync_dist=True)
         self.log('train/loss_pred', loss_pred, sync_dist=True)
         self.log('train/loss_overlap', loss_overlap, sync_dist=True)
@@ -63,12 +56,10 @@ class LFModule(L.LightningModule):
     # === DDP 兼容的验证逻辑 ===
     
     def on_validation_epoch_start(self):
-        # 改用列表存储，方便 stack
         self.val_step_outputs = [] 
 
     def validation_step(self, batch, batch_idx):
         pred_chunk, _ = self(batch)
-        # 仅收集预测、GT和索引，不收集 Center 图
         self.val_step_outputs.append({
             'pred': pred_chunk.detach(),
             'gt': batch['gt_rgb'].detach(),
@@ -78,18 +69,17 @@ class LFModule(L.LightningModule):
 
     def on_validation_epoch_end(self):
         """
-        全卡收集 -> CPU 拼图 -> 计算指标 -> 可视化
+        全卡收集 -> CPU 拼图 -> 计算指标 -> 可视化 (Center | Pred | GT)
         """
-        
-        # [修复] 如果是在进行 Sanity Check (只跑几个 batch), 数据肯定不全
+        # 如果是在进行 Sanity Check (只跑几个 batch), 数据肯定不全
         # 此时强制跳过繁重的拼图和可视化逻辑
         if self.trainer.sanity_checking:
             self.val_step_outputs.clear()
             return
+
+        if not self.val_step_outputs:
+            return
             
-        # 1. 在单卡内部 Stack 起来
-        if not self.val_step_outputs: return
-        
         # 1. DDP 收集
         local_preds = torch.cat([x['pred'] for x in self.val_step_outputs], dim=0)
         local_gts = torch.cat([x['gt'] for x in self.val_step_outputs], dim=0)
@@ -103,10 +93,11 @@ class LFModule(L.LightningModule):
 
         # 2. 仅在 Rank 0 拼图、计算指标和可视化
         if self.global_rank == 0:
+            # 验证阶段 val_dataset 肯定存在
             val_h5_files = self.trainer.datamodule.val_dataset.h5_files
             unique_files = torch.unique(global_fidxs)
             
-            # [新增] 累加器
+            # [恢复] 累加器
             total_psnr = 0.0
             total_ssim = 0.0
             num_images = 0
@@ -123,11 +114,11 @@ class LFModule(L.LightningModule):
                 H = int(img_p.shape[0]**0.5)
                 if H*H != img_p.shape[0]: continue
                 
-                # 转换为图像维度 [1, 3, H, W]
+                # 转换为图像维度 [1, 3, H, W]，移回 GPU 计算指标
                 view_p = img_p.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1).to(self.device)
                 view_g = img_g.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1).to(self.device)
                 
-                # === [新增] 计算单张图的指标 ===
+                # === [恢复] 计算单张图的指标 ===
                 cur_psnr = self.psnr(view_p, view_g)
                 cur_ssim = self.ssim(view_p, view_g)
                 
@@ -135,20 +126,30 @@ class LFModule(L.LightningModule):
                 total_ssim += cur_ssim
                 num_images += 1
                 
-                # 可视化第一张图
+                # [恢复] 可视化第一张图 (Center | Pred | GT)
                 if num_images == 1:
                     h5_path = val_h5_files[fid]
-                    with h5py.File(h5_path, 'r') as f:
-                        center_img = torch.from_numpy(f['occ_center/rgb'][:]).float() / 255.0
-                        center_view = center_img.permute(2, 0, 1).unsqueeze(0).to(self.device)
-                    
-                    if center_view.shape[2:] != view_p.shape[2:]:
-                        print(f"[Warning] Skip Vis: Shape mismatch Ref{center_view.shape} vs Pred{view_p.shape}")
+                    # 尝试读取 Center View
+                    center_view = None
+                    try:
+                        with h5py.File(h5_path, 'r') as f:
+                            if 'occ_center/rgb' in f:
+                                center_img = torch.from_numpy(f['occ_center/rgb'][:]).float() / 255.0
+                                center_view = center_img.permute(2, 0, 1).unsqueeze(0).to(self.device)
+                    except Exception as e:
+                        print(f"[Vis Warning] Could not read center view: {e}")
+
+                    # 检查形状匹配并拼图
+                    if center_view is not None and center_view.shape[2:] == view_p.shape[2:]:
+                         # 三联图
+                         grid = torch.cat([center_view, view_p, view_g], dim=3)
                     else:
-                        grid = torch.cat([center_view, view_p, view_g], dim=3)
-                        self.logger.experiment.add_image('val/Comparison', grid[0], self.global_step)
+                         # 只有 Pred 和 GT
+                         grid = torch.cat([view_p, view_g], dim=3)
+
+                    self.logger.experiment.add_image('val/Comparison', grid[0], self.global_step)
             
-            # === [新增] 记录平均指标 ===
+            # === [恢复] 记录平均指标 ===
             if num_images > 0:
                 avg_psnr = total_psnr / num_images
                 avg_ssim = total_ssim / num_images
@@ -159,11 +160,108 @@ class LFModule(L.LightningModule):
         # 清空
         self.val_step_outputs.clear()
 
-    # === 验证逻辑结束 ===
-    
+    def on_test_epoch_start(self):
+        self.test_step_outputs = []
+
     def test_step(self, batch, batch_idx):
-        """测试步骤（逻辑同 Val）"""
-        return self.validation_step(batch, batch_idx)
+        # 必须独立实现，因为我们要保存用于拼图的所有 chunks
+        pred_chunk, _ = self(batch)
+        self.test_step_outputs.append({
+            'pred': pred_chunk.detach(),
+            'gt': batch['gt_rgb'].detach(),
+            'file_idx': batch['meta_file_idx'], # 哪张图
+            'start_idx': batch['meta_start']    # 哪个位置
+        })
+
+    def on_test_epoch_end(self):
+        if not self.test_step_outputs: return
+
+        # 1. 聚合所有卡上的 Chunks
+        local_preds = torch.cat([x['pred'] for x in self.test_step_outputs], dim=0)
+        local_gts = torch.cat([x['gt'] for x in self.test_step_outputs], dim=0)
+        local_fidxs = torch.cat([x['file_idx'] for x in self.test_step_outputs], dim=0)
+        local_starts = torch.cat([x['start_idx'] for x in self.test_step_outputs], dim=0)
+
+        # 移动到 CPU 并聚合 (防止 OOM)
+        global_preds = self.all_gather(local_preds).view(-1, local_preds.shape[1], 3).cpu()
+        global_gts = self.all_gather(local_gts).view(-1, local_gts.shape[1], 3).cpu()
+        global_fidxs = self.all_gather(local_fidxs).view(-1).cpu()
+        global_starts = self.all_gather(local_starts).view(-1).cpu()
+
+        # 2. 仅在 Rank 0 处理拼图和保存图片
+        if self.global_rank == 0:
+            # [修正点]：安全获取 test filenames
+            test_h5_files = []
+            if hasattr(self.trainer.datamodule, 'test_dataset'):
+                test_h5_files = self.trainer.datamodule.test_dataset.h5_files
+            else:
+                print("Warning: test_dataset not found in DataModule. Filenames will be unavailable.")
+
+            unique_files = torch.unique(global_fidxs) # 使用全局索引
+            print(f"正在处理 {len(unique_files)} 张测试图像...")
+            
+            # 使用 log 文件记录指标
+            os.makedirs(self.save_dir, exist_ok=True)
+            log_path = os.path.join(self.save_dir, "metrics.txt")
+            
+            with open(log_path, "w") as f:
+                f.write("Filename, PSNR, SSIM\n")
+                
+                total_psnr = 0
+                total_ssim = 0
+                count = 0
+
+                for fid in unique_files:
+                    fid = int(fid.item())
+                    if fid < 0: continue
+                    
+                    mask = (global_fidxs == fid)
+                    
+                    current_starts = global_starts[mask]
+                    sort_idx = torch.argsort(current_starts)
+                    
+                    img_p = global_preds[mask][sort_idx].reshape(-1, 3)
+                    img_g = global_gts[mask][sort_idx].reshape(-1, 3)
+                    
+                    H = int(img_p.shape[0]**0.5)
+                    if H*H != img_p.shape[0]: 
+                        print(f"Skipping fid={fid}, shape mismatch: {img_p.shape}")
+                        continue
+                    
+                    # 转换为图像维度
+                    view_p = img_p.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1)
+                    view_g = img_g.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1)
+                    
+                    cur_psnr = self.psnr(view_p, view_g).item()
+                    cur_ssim = self.ssim(view_p, view_g).item()
+                    
+                    total_psnr += cur_psnr
+                    total_ssim += cur_ssim
+                    count += 1
+                    
+                    # 获取文件名
+                    if fid < len(test_h5_files):
+                        # 兼容 Window/Linux 路径分隔符
+                        fname = os.path.splitext(os.path.basename(test_h5_files[fid]))[0]
+                    else:
+                        fname = f"unknown_{fid}"
+
+                    # 保存图片 (横向拼接)
+                    save_path = os.path.join(self.save_dir, f"{fname}.png")
+                    grid = torch.cat([view_p, view_g], dim=3) 
+                    save_image(grid, save_path)
+                    
+                    log_str = f"{fname}, {cur_psnr:.4f}, {cur_ssim:.4f}"
+                    f.write(log_str + "\n")
+                
+                if count > 0:
+                    avg_psnr = total_psnr / count
+                    avg_ssim = total_ssim / count
+                    final_log = f"\nAverage: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n"
+                    print(final_log)
+                    f.write(final_log)
+
+        self.test_step_outputs.clear()
 
     def configure_optimizers(self):
         """配置带线性预热和余弦退火的学习率调度器"""
@@ -203,7 +301,7 @@ class LFModule(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step", # 关键：设置为按 step 更新
+                "interval": "step",
             },
         }
 
@@ -230,12 +328,23 @@ if __name__ == "__main__":
     # 加载配置
     config = get_config()
     mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
+    
+    # 构造保存目录
+    result_save_dir = os.path.join("pred_data", mode)
+    os.makedirs(result_save_dir, exist_ok=True)
+
     # 1. 初始化模型包装器
-    model = LFModule(config=config, n_rays=config.train.num_rays)
+    model = LFModule(
+        config=config, 
+        n_rays=config.train.num_rays,
+        save_dir=result_save_dir
+    )
     
     # 2. 创建数据模块
     dm = LFDataModule(
         data_dir="data",
+        train_data_dir="data/train_data",
+        test_data_dir="data/test_data",
         model=mode,
         batch_size=1,
         num_workers=4,
@@ -254,8 +363,8 @@ if __name__ == "__main__":
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
                 filename="lfnr-{epoch:02d}",
-                monitor="epoch",  # 监控 epoch 数量
-                mode="max",       # 保存 epoch 最大的（也就是最新的）
+                monitor="epoch",
+                mode="max",
                 save_top_k=4,
                 every_n_epochs=5
             ),
@@ -265,26 +374,20 @@ if __name__ == "__main__":
         check_val_every_n_epoch=5, 
     )
 
-
-    # 打印模型信息
-    print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
     # --- 增加断点重训逻辑 ---
     ckpt_dir = os.path.join("checkpoints", mode)
     last_ckpt = None
     if os.path.exists(ckpt_dir):
-        # 寻找目录下所有的 .ckpt 文件
         ckpts = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')]
         if ckpts:
-            # 找到最后修改的文件（通常是最近保存的）
             last_ckpt = max(ckpts, key=os.path.getmtime)
-            print(f"检测到断点文件，将从此处恢复训练: {last_ckpt}")
+            print(f"检测到断点文件，将从此处恢复训练/测试: {last_ckpt}")
 
     # 开始训练 (传入 ckpt_path 参数)
     trainer.fit(model, dm, ckpt_path=last_ckpt)
     
-    # # 可选：测试最佳模型
-    # trainer.test(model, dm, ckpt_path="best")
+    # 测试最佳模型
+    print("=== 开始测试 ===")
+    trainer.test(model, dm, ckpt_path=last_ckpt)
     
-    print("=== 训练完成 ===")
+    print("=== 完成 ===")

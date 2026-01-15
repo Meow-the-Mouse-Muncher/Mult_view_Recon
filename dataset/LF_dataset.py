@@ -188,38 +188,52 @@ class LFDataset(Dataset):
 
 class LFDataModule(L.LightningDataModule):
     """PyTorch Lightning 数据模块，用于管理 LF 数据集."""
-    def __init__(self, data_dir: str, model: str = None, batch_size: int = 4, num_workers: int = 4, n_rays: int = 4096, val_chunk_size: int = 4096):
+    def __init__(self, data_dir: str, train_data_dir: Optional[str] = None, test_data_dir: Optional[str] = None, model: str = None, batch_size: int = 4, num_workers: int = 4, n_rays: int = 4096, val_chunk_size: int = 4096):
         super().__init__()
-        # 如果指定了 model(mode)，则只读取对应目录下的数据
+        
+        # 1. 确定基础目录
+        # 如果从外部传入了特定路径，就用传入的；否则基于 data_dir 自动推断
+        _train_base = train_data_dir if train_data_dir else os.path.join(data_dir, "train_data")
+        _test_base = test_data_dir if test_data_dir else os.path.join(data_dir, "test_data")
+
+        # 2. 如果指定了 model (即 mode, 如 "rot_arc")，则进入子目录
+        # 这样避免读取到其他 mode 的数据
         if model:
-            self.data_dir = os.path.join(data_dir, model)
+            self.train_data_dir = os.path.join(_train_base, model)
+            self.test_data_dir = os.path.join(_test_base, model)
         else:
-            self.data_dir = data_dir
+            self.train_data_dir = _train_base
+            self.test_data_dir = _test_base
+            
+        print(f"Dataset Config:")
+        print(f"  - Train Dir: {self.train_data_dir}")
+        print(f"  - Test  Dir: {self.test_data_dir}")
             
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.n_rays = n_rays
-        self.val_chunk_size = val_chunk_size # 保存参数
-        self.h5_files = self._find_h5_files()
+        self.val_chunk_size = val_chunk_size
+        # 移除 self.h5_files，因为现在按 stage 动态查找
 
-    def _find_h5_files(self):
-        """递归查找所有 .h5 文件。"""
+    def _find_h5_files_in_dir(self, dir_path: str):
+        """在指定目录递归查找所有 .h5 文件。"""
         h5_files = []
-        if not os.path.exists(self.data_dir):
+        if not os.path.exists(dir_path):
             return h5_files
-        for root, dirs, files in os.walk(self.data_dir):
+        for root, dirs, files in os.walk(dir_path):
             for file in files:
                 if file.endswith('.h5'):
                     h5_files.append(os.path.join(root, file))
-        h5_files.sort() # 排序保证稳定性
+        h5_files.sort()  # 排序保证稳定性
         return h5_files
 
     def setup(self, stage: Optional[str] = None):
         """设置数据集划分"""
         if stage == 'fit' or stage is None:
+            # 使用 train_data_dir 查找训练和验证文件
+            train_val_files = self._find_h5_files_in_dir(self.train_data_dir)
             # 为了保证划分的随机性且可重复，先根据种子打乱列表
-            # 注意：这里使用局部 Random 实例以不影响全局随机状态
-            shuffled_files = self.h5_files.copy()
+            shuffled_files = train_val_files.copy()
             random.Random(42).shuffle(shuffled_files)
             
             # 划分：前 99.5% 为 train，后 0.5% 为 val
@@ -227,7 +241,9 @@ class LFDataModule(L.LightningDataModule):
             self.train_dataset = LFDataset(shuffled_files[:train_size], split='train', n_rays=self.n_rays)
             self.val_dataset = LFDataset(shuffled_files[train_size:], split='val', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size)
         elif stage == 'test':
-            self.test_dataset = LFDataset(self.h5_files, split='test', n_rays=self.n_rays)
+            # 使用 test_data_dir 查找测试文件
+            test_files = self._find_h5_files_in_dir(self.test_data_dir)
+            self.test_dataset = LFDataset(test_files, split='test', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
