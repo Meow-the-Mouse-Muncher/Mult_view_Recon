@@ -6,4 +6,4 @@ checkpoints/*
 logs/*
 dataset/__pycache__/*
 sparse_data
-pred_data
+pred_data*

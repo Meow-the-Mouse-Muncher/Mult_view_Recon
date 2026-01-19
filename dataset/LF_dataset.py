@@ -198,7 +198,8 @@ class LFDataModule(L.LightningDataModule):
 
         # 2. 如果指定了 model (即 mode, 如 "rot_arc")，则进入子目录
         # 这样避免读取到其他 mode 的数据
-        if model:
+        # 如果 model 为 "mix"，则读取 base 目录下所有子目录的数据
+        if model and model != "mix":
             self.train_data_dir = os.path.join(_train_base, model)
             self.test_data_dir = os.path.join(_test_base, model)
         else:
@@ -236,8 +237,8 @@ class LFDataModule(L.LightningDataModule):
             shuffled_files = train_val_files.copy()
             random.Random(42).shuffle(shuffled_files)
             
-            # 划分：前 99.5% 为 train，后 0.5% 为 val
-            train_size = int(0.995 * len(shuffled_files))
+            # 划分：前 99% 为 train，后 1% 为 val
+            train_size = int(0.99 * len(shuffled_files))
             self.train_dataset = LFDataset(shuffled_files[:train_size], split='train', n_rays=self.n_rays)
             self.val_dataset = LFDataset(shuffled_files[train_size:], split='val', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size)
         elif stage == 'test':
@@ -249,9 +250,9 @@ class LFDataModule(L.LightningDataModule):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        # 验证集 batch_size=1, shuffle=True! 这里预览看到更多的数据
+        # 验证集 batch_size=1, shuffle=False
         # 因为我们已经手动 chunk 了，每个 Item 就是一个 Batch
-        return DataLoader(self.val_dataset, batch_size=1, shuffle=True, num_workers=self.num_workers)
+        return DataLoader(self.val_dataset, batch_size=1, shuffle=False, num_workers=self.num_workers)
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=1, shuffle=False, num_workers=self.num_workers)

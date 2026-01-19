@@ -93,10 +93,10 @@ def get_lf_config():
 def get_train_config():
     """训练超参数配置"""
     return {
-        "lr_init": 2.0e-3,
+        "lr_init": 1.5e-3,
         "weight_decay": 0.0,
         "warmup_steps": 2.5e3,
-        "max_steps": 1.5e5,
+        "max_steps": 2.5e5,
         "lr_final": 1.0e-5,
         "grad_max_norm": 0,
         "grad_max_val": 0,

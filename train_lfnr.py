@@ -228,7 +228,7 @@ class LFModule(L.LightningModule):
                         print(f"Skipping fid={fid}, shape mismatch: {img_p.shape}")
                         continue
                     
-                    # 转换为图像维度
+                    # 转换为图像维度 (此时在 CPU 上)
                     view_p = img_p.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1)
                     view_g = img_g.view(1, H, H, 3).permute(0, 3, 1, 2).clamp(0, 1)
                     
@@ -241,14 +241,29 @@ class LFModule(L.LightningModule):
                     
                     # 获取文件名
                     if fid < len(test_h5_files):
-                        # 兼容 Window/Linux 路径分隔符
-                        fname = os.path.splitext(os.path.basename(test_h5_files[fid]))[0]
+                        h5_path = test_h5_files[fid]
+                        fname = os.path.splitext(os.path.basename(h5_path))[0]
+                        
+                        # [新增] 尝试读取 Center View 用于同步三拼图可视化
+                        center_view = None
+                        try:
+                            with h5py.File(h5_path, 'r') as h5f:
+                                if 'occ_center/rgb' in h5f:
+                                    center_img = torch.from_numpy(h5f['occ_center/rgb'][:]).float() / 255.0
+                                    center_view = center_img.permute(2, 0, 1).unsqueeze(0)
+                        except Exception as e:
+                            print(f"[Test Vis Warning] Could not read center view for {fname}: {e}")
                     else:
                         fname = f"unknown_{fid}"
+                        center_view = None
 
-                    # 保存图片 (横向拼接)
+                    # 保存图片 (根据是否有 center_view 决定是三拼还是双拼)
                     save_path = os.path.join(self.save_dir, f"{fname}.png")
-                    grid = torch.cat([view_p, view_g], dim=3) 
+                    if center_view is not None and center_view.shape[2:] == view_p.shape[2:]:
+                        grid = torch.cat([center_view, view_p, view_g], dim=3)
+                    else:
+                        grid = torch.cat([view_p, view_g], dim=3)
+                    
                     save_image(grid, save_path)
                     
                     log_str = f"{fname}, {cur_psnr:.4f}, {cur_ssim:.4f}"
@@ -327,7 +342,7 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config()
-    mode = "rot_arc" # mode =[fix_line,rot_arc,rot_line]
+    mode = "mix" # mode =[fix_line, rot_arc, rot_line, mix]
     
     # 构造保存目录
     result_save_dir = os.path.join("pred_data", mode)
@@ -363,15 +378,16 @@ if __name__ == "__main__":
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=os.path.join("checkpoints", mode),
                 filename="lfnr-{epoch:02d}",
-                monitor="epoch",
-                mode="max",
+                monitor="epoch",  # 监控 epoch 数量
+                mode="max",       # 保存 epoch 最大的（也就是最新的）
                 save_top_k=4,
-                every_n_epochs=5
+                every_n_epochs=5,
+                save_on_train_epoch_end=True # 改在训练结束时保存，不等待验证
             ),
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
-        log_every_n_steps=50,
-        check_val_every_n_epoch=5, 
+        log_every_n_steps=100,
+        check_val_every_n_epoch=20, 
     )
 
     # --- 增加断点重训逻辑 ---

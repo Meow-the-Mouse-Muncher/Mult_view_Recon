@@ -117,5 +117,5 @@ def process_to_h5(root_dir, save_dir):
 
 if __name__ == "__main__":
     DATA_ROOT = "/home_ssd/sjy/UE5_Project/PCGBiomeForestPoplar/Saved/MovieRenders/test_data"
-    SAVE_DIR = "/home_ssd/sjy/Active_cam_recon/test_data" # 建议换个目录或者增加后缀以区分
+    SAVE_DIR = "/home_ssd/sjy/Active_cam_recon/data/test_data" # 建议换个目录或者增加后缀以区分
     process_to_h5(DATA_ROOT, SAVE_DIR)
