@@ -2,9 +2,9 @@ import os
 import torch
 import lightning as L
 from torch import nn
-from models.lfnr import LFNR
+from models.lnfr_no3d import LFNR
 from dataset.LF_dataset import LFDataModule
-from configs.config import get_config
+from configs.config_no3d import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import h5py 
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     
     # 加载配置
     config = get_config()
-    mode = "mix" # mode =[fix_line, rot_arc, rot_line, mix]
+    mode = "rot_arc" # mode =[fix_line, rot_arc, rot_line, mix]
     
     # 构造保存目录
     result_save_dir = os.path.join("pred_data", mode)

@@ -63,7 +63,7 @@ def get_model_config():
             "layers": 8,
             "heads": 4,
             "embed_dim": 256,
-            "key_dim": 130,
+            "key_dim": 103,
             "query_dim": 36,
             "mlp_dim": 256
         },
