@@ -1,10 +1,11 @@
 import os
+import time
 import torch
 import lightning as L
 from torch import nn
-from models.lnfr_no3d import LFNR
+from models.lfnr import LFNR
 from dataset.LF_dataset import LFDataModule
-from configs.config_no3d import get_config
+from configs.config import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import h5py 
@@ -338,24 +339,33 @@ class LFModule(L.LightningModule):
     #         print("="*50 + "\n")
 
 if __name__ == "__main__":
-    print("=== 开始训练 LFNR 模型 ===")
+    import argparse
+    start_time = time.time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_name", type=str, default="LF", help="消融实验名称")
+    parser.add_argument("--mode", type=str, default="rot_arc", help="数据模式: fix_line, rot_arc, rot_line, mix")
+    args, _ = parser.parse_known_args()
+
+    print(f"=== 开始训练 LFNR 模型 | 实验: {args.exp_name} | 模式: {args.mode} ===")
     
-    # 加载配置
+    # 1. 加载参数
     config = get_config()
-    mode = "rot_arc" # mode =[fix_line, rot_arc, rot_line, mix]
+    exp_name = args.exp_name
+    mode = args.mode
     
-    # 构造保存目录
-    result_save_dir = os.path.join("pred_data", mode)
+    # 2. 构造路径: 实验名/mode
+    result_save_dir = os.path.join("pred_data", exp_name, mode)
+    checkpoint_dir = os.path.join("checkpoints", exp_name, mode)
     os.makedirs(result_save_dir, exist_ok=True)
 
-    # 1. 初始化模型包装器
+    # 初始化模型包装器
     model = LFModule(
         config=config, 
         n_rays=config.train.num_rays,
         save_dir=result_save_dir
     )
     
-    # 2. 创建数据模块
+    # 创建数据模块
     dm = LFDataModule(
         data_dir="data",
         train_data_dir="data/train_data",
@@ -367,43 +377,49 @@ if __name__ == "__main__":
         val_chunk_size=config.eval.chunk 
     )
 
-    # 创建 Trainer
+    # 3. 创建 Trainer，配置 Logger 和 Checkpoint 路径
     trainer = L.Trainer(
         max_steps=config.train.max_steps,
         accelerator="gpu",
         devices=2,  
         strategy="ddp",
-        logger=TensorBoardLogger("logs", name=mode, version=None), 
+        logger=TensorBoardLogger("logs", name=exp_name, version=mode), 
         callbacks=[
             L.pytorch.callbacks.ModelCheckpoint(
-                dirpath=os.path.join("checkpoints", mode),
+                dirpath=checkpoint_dir,
                 filename="lfnr-{epoch:02d}",
-                monitor="epoch",  # 监控 epoch 数量
-                mode="max",       # 保存 epoch 最大的（也就是最新的）
+                monitor="epoch",
+                mode="max",
                 save_top_k=4,
                 every_n_epochs=5,
-                save_on_train_epoch_end=True # 改在训练结束时保存，不等待验证
+                save_on_train_epoch_end=True
             ),
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
-        log_every_n_steps=100,
-        check_val_every_n_epoch=20, 
+        log_every_n_steps=50,
+        check_val_every_n_epoch=10, 
     )
 
-    # --- 增加断点重训逻辑 ---
-    ckpt_dir = os.path.join("checkpoints", mode)
+    # 断点重训逻辑使用新路径
     last_ckpt = None
-    if os.path.exists(ckpt_dir):
-        ckpts = [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')]
+    if os.path.exists(checkpoint_dir):
+        ckpts = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
         if ckpts:
             last_ckpt = max(ckpts, key=os.path.getmtime)
-            print(f"检测到断点文件，将从此处恢复训练/测试: {last_ckpt}")
+            print(f"检测到断点文件: {last_ckpt}")
 
-    # 开始训练 (传入 ckpt_path 参数)
+    # 开始训练
     trainer.fit(model, dm, ckpt_path=last_ckpt)
     
-    # 测试最佳模型
+    # 测试
     print("=== 开始测试 ===")
     trainer.test(model, dm, ckpt_path=last_ckpt)
     
-    print("=== 完成 ===")
+    end_time = time.time()
+    duration = end_time - start_time
+    hours = int(duration // 3600)
+    minutes = int((duration % 3600) // 60)
+    seconds = int(duration % 60)
+    
+    print(f"=== 完成 ===")
+    print(f"🚀 运行总时长: {hours}小时 {minutes}分 {seconds}秒")

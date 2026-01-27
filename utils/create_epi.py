@@ -46,8 +46,8 @@ def create_epi(rgb_dir, output_path, mode='row', index=None):
             continue
             
         # # 如果索引在中间之后，旋转 180 度
-        # if i > mid_idx:
-        #     img = cv2.rotate(img, cv2.ROTATE_180)
+        if i > mid_idx:
+            img = cv2.rotate(img, cv2.ROTATE_180)
             
         if mode == 'row':
             # 提取指定行: [width, channels]
@@ -71,7 +71,7 @@ def create_epi(rgb_dir, output_path, mode='row', index=None):
 
 if __name__ == "__main__":
     # 配置路径
-    base_dir = "/home_ssd/sjy/Active_cam_recon/test/rot_arc"
+    base_dir = "/home_ssd/sjy/Active_cam_recon/test_data/rot_arc"
     rgb_path = os.path.join(base_dir, "scene_010_Target_002_height_050_ang_000_GT/rgb")
     
     # 示例 1: 生成第 512 行（图像中心附近）的水平 EPI
