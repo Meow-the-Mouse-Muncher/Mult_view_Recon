@@ -6,8 +6,8 @@ import argparse
 import h5py
 from torchvision.utils import save_image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from models.lnfr_noLF import LFNR 
-from configs.config_noLF import get_config
+from models.lfnr import LFNR 
+from configs.config import get_config
 from dataset.LF_dataset import LFDataModule
 
 class LFModule(L.LightningModule):
@@ -100,9 +100,9 @@ class LFModule(L.LightningModule):
 
 def main():
     parser = argparse.ArgumentParser(description="LFNR Inference Script")
-    parser.add_argument("--ckpt", type=str,default="checkpoints/noLF/rot_arc/lfnr-epoch=174.ckpt", help="Path to the checkpoint (.ckpt) file")
-    parser.add_argument("--data_dir", type=str, default="data", help="Root directory of the dataset") # 改回顶层 data 文件夹
-    parser.add_argument("--save_dir", type=str, default="inference/noLF", help="Directory to save the predicted images")
+    parser.add_argument("--ckpt", type=str,default="checkpoints/base_LF/rot_arc/lfnr-epoch=174.ckpt", help="Path to the checkpoint (.ckpt) file")
+    parser.add_argument("--data_dir", type=str, default="data", help="Root directory of the dataset") #
+    parser.add_argument("--save_dir", type=str, default="inference/base_LF", help="Directory to save the predicted images")
     parser.add_argument("--mode", type=str, default="fix_line", help="Data mode: fix_line, rot_arc, etc.")
     parser.add_argument("--devices", type=int, default=2, help="Number of GPUs to use")
     args = parser.parse_args()
@@ -117,7 +117,7 @@ def main():
     model = LFModule.load_from_checkpoint(checkpoint_path=args.ckpt)
     
     # 手动赋值，绕过 OmegaConf 的只读限制
-    model.save_dir = args.save_dir
+    model.save_dir = os.path.join(args.save_dir, args.mode)
 
     # 3. 初始化数据模块
     # 简化传参，让 LFDataModule 自动根据 mode 构建路径

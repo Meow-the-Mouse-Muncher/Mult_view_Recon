@@ -243,6 +243,48 @@ def get_sampling_grid(pts_3d: torch.Tensor, ref_poses: torch.Tensor, K: torch.Te
     return sampling_grid
 
 
+def get_per_ray_sampling_grid(pts_3d: torch.Tensor, ref_poses: torch.Tensor, K: torch.Tensor, H: int, W: int):
+    """
+    计算每条光线在其对应的K个最近相机中的投影坐标（向量化版本）。
+    适用于动态相机选择场景，每条光线有独立的相机集合。
+    
+    Args:
+        pts_3d: [n_rays, 3] 世界坐标系下的 3D 点
+        ref_poses: [n_rays, K, 4, 4] 每条光线对应的K个最近相机的位姿 (c2w)
+        K: [3, 3] 相机内参
+        H, W: 图像尺寸
+    Returns:
+        sampling_grid: [n_rays, K, 2] 归一化坐标 [-1, 1], 用于 grid_sample
+    """
+    n_rays, K_cams, _, _ = ref_poses.shape
+    
+    # 世界坐标转相机坐标: P_cam = R_w2c * P_world + T_w2c
+    # R_w2c = R_c2w^T, T_w2c = -R_c2w^T * T_c2w
+    R_w2c = ref_poses[:, :, :3, :3].transpose(2, 3)  # [n_rays, K, 3, 3]
+    T_w2c = -torch.matmul(R_w2c, ref_poses[:, :, :3, 3:4])  # [n_rays, K, 3, 1]
+    
+    # 扩展3D点以匹配相机维度: [n_rays, 3] -> [n_rays, K, 3, 1]
+    pts_expanded = pts_3d.unsqueeze(1).unsqueeze(-1).expand(n_rays, K_cams, 3, 1)
+    
+    # 变换到相机坐标系
+    pts_cam = torch.matmul(R_w2c, pts_expanded) + T_w2c  # [n_rays, K, 3, 1]
+    
+    # 投影到像素平面: P_uv = K * P_cam
+    K_expanded = K.unsqueeze(0).unsqueeze(0).expand(n_rays, K_cams, 3, 3)
+    pts_uv = torch.matmul(K_expanded, pts_cam)  # [n_rays, K, 3, 1]
+    
+    # 透视除法
+    z = pts_uv[:, :, 2:3, :] + 1e-6
+    uv = pts_uv[:, :, :2, :] / z  # [n_rays, K, 2, 1]
+    
+    # 归一化到 [-1, 1] (grid_sample align_corners=True)
+    grid_u = 2.0 * (uv[:, :, 0, 0] - 0.5) / (W - 1) - 1.0  # [n_rays, K]
+    grid_v = 2.0 * (uv[:, :, 1, 0] - 0.5) / (H - 1) - 1.0  # [n_rays, K]
+    
+    sampling_grid = torch.stack([grid_u, grid_v], dim=-1)  # [n_rays, K, 2]
+    return sampling_grid
+
+
 def recenter_poses(poses):
     """Recenter poses according to the original NeRF code.
     Input: poses [N, 4, 4]

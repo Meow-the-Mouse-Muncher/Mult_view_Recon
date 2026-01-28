@@ -10,3 +10,4 @@ pred_data*
 test_data/*
 scene_*
 *__pycache__*
+inference*
