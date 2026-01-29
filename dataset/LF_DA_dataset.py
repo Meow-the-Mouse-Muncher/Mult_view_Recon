@@ -11,12 +11,13 @@ from typing import Optional
 
 class LFDataset(Dataset):
     """从 HDF5 文件加载 LF 数据的数据集类。"""
-    def __init__(self, h5_files: list, split: str = 'train', n_rays: int = 4096, val_chunk_size: int = 4096, k_nearest_cams: int = 9):
+    def __init__(self, h5_files: list, split: str = 'train', n_rays: int = 4096, val_chunk_size: int = 4096, max_k_cams: int = 16, cone_angle: float = 30.0):
         self.h5_files = h5_files
         self.split = split
         self.n_rays = n_rays
         self.val_chunk_size = val_chunk_size # 使用传入的参数
-        self.k_nearest_cams = k_nearest_cams # 每条光线使用的最近相机数量
+        self.max_k_cams = max_k_cams   # 最大相机容量
+        self.cone_angle = cone_angle   # 视锥角度阈值
         
         # === 验证集切片配置 ===
         self.val_meta = [] # 存储切块索引信息: (file_idx, start, end)
@@ -93,16 +94,31 @@ class LFDataset(Dataset):
             gt_rays_o, gt_rays_d = generate_rays(H, W, K, gt_pose, coords=pixel_coords)
             pts_3d = compute_pts3d(H, W, K, gt_pose, sampled_depth, coords=pixel_coords)
             
-            # 5. 为每条光线选择最近的 K 个相机
+            # 5. 基于视锥角度选择相机 (Cone Angle Selection)
             N = occ_poses.shape[0]
             cam_centers = occ_poses[:, :3, 3]  # [N, 3]
+            gt_center = gt_pose[:3, 3]         # [3]
             
-            # 计算每个3D点到所有相机中心的距离 [n_rays, N]
-            distances = torch.cdist(pts_3d, cam_centers)  # [n_rays, N]
+            # (1) 计算向量 & 归一化 (使用 Point->Camera 方向)
+            v_target = torch.nn.functional.normalize(gt_center.unsqueeze(0) - pts_3d, dim=-1) # [n_rays, 3]
+            v_fixed = torch.tensor([0.0, 0.0, 1.0], device=pts_3d.device).expand_as(v_target)
+            v_ref = torch.nn.functional.normalize(v_target + v_fixed, dim=-1) # [n_rays, 3]
             
-            # 为每条光线选择最近的 K 个相机
-            K_cams = min(self.k_nearest_cams, N)  # 防止K大于相机总数
-            _, nearest_cam_indices = torch.topk(distances, K_cams, dim=1, largest=False)  # [n_rays, K]
+            # (2) 计算所有相机的方向向量
+            # cam_centers [1, N, 3] - pts_3d [n_rays, 1, 3] -> [n_rays, N, 3]
+            v_cams = torch.nn.functional.normalize(cam_centers.unsqueeze(0) - pts_3d.unsqueeze(1), dim=-1)
+            
+            # (3) 计算余弦相似度
+            cos_sim = torch.sum(v_ref.unsqueeze(1) * v_cams, dim=-1) # [n_rays, N]
+            
+            # (4) Top-K 选取 (带 Mask)
+            K_safe = min(self.max_k_cams, N)
+            # 因为我们要找夹角最小(余弦最大)，所以 largest=True
+            sim_values, nearest_cam_indices = torch.topk(cos_sim, K_safe, dim=1, largest=True) # [n_rays, K]
+            
+            # (5) 生成 Mask
+            threshold = np.cos(np.deg2rad(self.cone_angle))
+            cam_mask = (sim_values > threshold).float() # [n_rays, K]
             
             # 6. 为选定的相机计算 sampling_grid 和射线（并行化批量处理）
             # 批量选择每条光线对应的K个相机的poses: [n_rays, K, 4, 4]
@@ -132,6 +148,7 @@ class LFDataset(Dataset):
                 'occ_rays_o': occ_rays_o,        # [n_rays, K, 3]
                 'occ_rays_d': occ_rays_d,        # [n_rays, K, 3]
                 'nearest_cam_indices': nearest_cam_indices,  # [n_rays, K] - 每条光线选择的相机索引
+                'cam_mask': cam_mask,            # [n_rays, K] - 视锥对应Mask
                 'K': K                           # 相机内参 [3, 3]
             }
 
@@ -175,16 +192,28 @@ class LFDataset(Dataset):
             chunk_depth = flat_depth[start:end]
             pts_3d = compute_pts3d(H, W, K, gt_pose, chunk_depth, coords=chunk_coords)
             
-            # 5. 为每条光线选择最近的 K 个相机（与训练逻辑一致）
+            # 5. 基于视锥角度选择相机 (逻辑同训练)
             N = occ_poses.shape[0]
             cam_centers = occ_poses[:, :3, 3]  # [N, 3]
+            gt_center = gt_pose[:3, 3]         # [3]
             
-            # 计算每个3D点到所有相机中心的距离 [chunk, N]
-            distances = torch.cdist(pts_3d, cam_centers)  # [chunk, N]
+            # (1) 向量计算
+            v_target = torch.nn.functional.normalize(gt_center.unsqueeze(0) - pts_3d, dim=-1) # [chunk, 3]
+            v_fixed = torch.tensor([0.0, 0.0, 1.0], device=pts_3d.device).expand_as(v_target)
+            v_ref = torch.nn.functional.normalize(v_target + v_fixed, dim=-1)
             
-            # 为每条光线选择最近的 K 个相机
-            K_cams = min(self.k_nearest_cams, N)  # 防止K大于相机总数
-            _, nearest_cam_indices = torch.topk(distances, K_cams, dim=1, largest=False)  # [chunk, K]
+            # (2) 相机方向
+            v_cams = torch.nn.functional.normalize(cam_centers.unsqueeze(0) - pts_3d.unsqueeze(1), dim=-1) # [chunk, N, 3]
+            
+            # (3) 相似度
+            cos_sim = torch.sum(v_ref.unsqueeze(1) * v_cams, dim=-1) # [chunk, N]
+            
+            # (4) Top-K & Mask
+            K_safe = min(self.max_k_cams, N)
+            sim_values, nearest_cam_indices = torch.topk(cos_sim, K_safe, dim=1, largest=True)
+            
+            threshold = np.cos(np.deg2rad(self.cone_angle))
+            cam_mask = (sim_values > threshold).float() # [chunk, K]
             
             # 6. 为选定的相机计算 sampling_grid 和射线（并行化批量处理）
             # 批量选择每条光线对应的K个相机的poses: [chunk, K, 4, 4]
@@ -225,6 +254,7 @@ class LFDataset(Dataset):
             'occ_rays_o': occ_rays_o,        # [chunk, K, 3]
             'occ_rays_d': occ_rays_d,        # [chunk, K, 3]
             'nearest_cam_indices': nearest_cam_indices,  # [chunk, K] - 每条光线选择的相机索引
+            'cam_mask': cam_mask,            # [chunk, K] - Mask
             'K': K,
             # 仅返回索引信息，不返回 Center 全图
             'meta_file_idx': torch.tensor(file_idx),
@@ -234,7 +264,9 @@ class LFDataset(Dataset):
 
 class LFDataModule(L.LightningDataModule):
     """PyTorch Lightning 数据模块，用于管理 LF 数据集."""
-    def __init__(self, data_dir: str, train_data_dir: Optional[str] = None, test_data_dir: Optional[str] = None, model: str = None, batch_size: int = 4, num_workers: int = 4, n_rays: int = 4096, val_chunk_size: int = 4096, k_nearest_cams: int = 9):
+    def __init__(self, data_dir: str, train_data_dir: Optional[str] = None, test_data_dir: Optional[str] = None, 
+                 model: str = None, batch_size: int = 4, num_workers: int = 4, n_rays: int = 4096, val_chunk_size: int = 4096, 
+                 max_k_cams: int = 16, cone_angle: float = 30.0):
         super().__init__()
         
         # 1. 确定基础目录
@@ -260,7 +292,8 @@ class LFDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.n_rays = n_rays
         self.val_chunk_size = val_chunk_size
-        self.k_nearest_cams = k_nearest_cams  # 最近相机数量
+        self.max_k_cams = max_k_cams
+        self.cone_angle = cone_angle
         # 移除 self.h5_files，因为现在按 stage 动态查找
 
     def _find_h5_files_in_dir(self, dir_path: str):
@@ -286,12 +319,12 @@ class LFDataModule(L.LightningDataModule):
             
             # 划分：前 99% 为 train，后 1% 为 val
             train_size = int(0.99 * len(shuffled_files))
-            self.train_dataset = LFDataset(shuffled_files[:train_size], split='train', n_rays=self.n_rays, k_nearest_cams=self.k_nearest_cams)
-            self.val_dataset = LFDataset(shuffled_files[train_size:], split='val', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size, k_nearest_cams=self.k_nearest_cams)
+            self.train_dataset = LFDataset(shuffled_files[:train_size], split='train', n_rays=self.n_rays, max_k_cams=self.max_k_cams, cone_angle=self.cone_angle)
+            self.val_dataset = LFDataset(shuffled_files[train_size:], split='val', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size, max_k_cams=self.max_k_cams, cone_angle=self.cone_angle)
         elif stage == 'test':
             # 使用 test_data_dir 查找测试文件
             test_files = self._find_h5_files_in_dir(self.test_data_dir)
-            self.test_dataset = LFDataset(test_files, split='test', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size, k_nearest_cams=self.k_nearest_cams)
+            self.test_dataset = LFDataset(test_files, split='test', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size, max_k_cams=self.max_k_cams, cone_angle=self.cone_angle)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)

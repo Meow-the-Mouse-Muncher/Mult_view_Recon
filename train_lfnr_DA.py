@@ -358,7 +358,8 @@ if __name__ == "__main__":
         num_workers=4,
         n_rays=config.train.num_rays,
         val_chunk_size=config.eval.chunk,
-        k_nearest_cams=config.dataset.k_nearest_cams
+        max_k_cams=config.dataset.max_k_cams,
+        cone_angle=config.dataset.cone_angle
     )
 
     # 3. 创建 Trainer，配置 Logger 和 Checkpoint 路径

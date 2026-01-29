@@ -174,12 +174,13 @@ class LFNR(nn.Module):
         out = torch.stack(outputs, dim=0).permute(0, 2, 1, 3)
         
         return out
-    def _predict_color(self, input_q, input_k):
+    def _predict_color(self, input_q, input_k, cam_mask=None):
         """
         基于 Transformer 的注意力机制预测颜色。
         Args:
             input_q: [B, n_rays, q_dim]
             input_k: [B, N, n_rays, k_dim]
+            cam_mask: [B, n_rays, N] - 可选 Mask
         Returns:
             rgb: [B, n_rays, 3]
             attn_weights: [B, n_rays, N, 1]
@@ -212,8 +213,16 @@ class LFNR(nn.Module):
         concat_feat = torch.cat([refined_query_expanded, refined_key], dim=-1)
         
         # attn_weights: [(B*n_rays), N, 1]
-        attn_weights = self.view_correspondence(concat_feat)
-        attn_weights = F.softmax(attn_weights, dim=1)
+        attn_logits = self.view_correspondence(concat_feat)
+        
+        # === [Critical] Apply Cam Mask ===
+        if cam_mask is not None:
+            # cam_mask: [B, n_rays, N] -> [(B*n_rays), N, 1]
+            mask_flat = cam_mask.reshape(B * n_rays, N, 1)
+            # Mask (0.0) 的位置设为 -inf
+            attn_logits = attn_logits.masked_fill(mask_flat < 0.5, -1e9)
+            
+        attn_weights = F.softmax(attn_logits, dim=1)
 
         # 6. 聚合特征并生成颜色
         # combined_feature: [(B*n_rays), embed_dim]
@@ -246,6 +255,7 @@ class LFNR(nn.Module):
         ref_rays_d = batch['occ_rays_d']    # [B, n_rays, K, 3]
         pts_3d = batch['pts_3d']        # [B, n_rays, 3]
         cam_indices = batch['nearest_cam_indices']  # [B, n_rays, K]
+        cam_mask = batch.get('cam_mask', None)      # [B, n_rays, K]
 
         # 2. Query 编码 (目标光线) q_dim = 36
         input_q = self._get_query(target_rays_o, target_rays_d) # [B, n_rays, q_dim]
@@ -260,7 +270,7 @@ class LFNR(nn.Module):
         
         input_k = self._get_key(projected_rgb_and_feat, ref_rays_o_permuted, ref_rays_d_permuted, pts_3d, cam_indices) # [B, K, n_rays, k_dim] k_dim=130
 
-        rgb,n_attn= self._predict_color(input_q, input_k)
+        rgb,n_attn= self._predict_color(input_q, input_k, cam_mask=cam_mask)
 
         rgb_overlap = self._overlap_color(projected_rgb_and_feat, n_attn)
         return rgb, rgb_overlap
