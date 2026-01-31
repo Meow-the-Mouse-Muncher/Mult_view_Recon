@@ -50,8 +50,8 @@ def get_dataset_config():
         "image_height": -1,
         "image_width": -1,
         "num_interpolation_views": 10,
-        "max_k_cams": 16,     # 最大相机容量 (缓冲区大小)
-        "cone_angle": 30.0    # 视锥角度阈值 (度)
+        "max_k_cams": 32,     # 最大相机容量 (缓冲区大小)
+        "cone_angle": 40    # 视锥角度阈值 (度)
     }
 
 

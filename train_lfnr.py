@@ -10,7 +10,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import h5py 
 from torchvision.utils import save_image
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 torch.set_float32_matmul_precision('high')
 
 class LFModule(L.LightningModule):
@@ -21,6 +21,7 @@ class LFModule(L.LightningModule):
         self.config = config
         self.n_rays = n_rays
         self.save_dir = save_dir
+        self.learning_rate = config.train.lr_init
         
         # 初始化模型
         self.model = LFNR(config=config)
@@ -283,7 +284,7 @@ class LFModule(L.LightningModule):
         """配置带线性预热和余弦退火的学习率调度器"""
         optimizer = torch.optim.AdamW(
             self.parameters(), 
-            lr=self.config.train.lr_init,
+            lr=self.learning_rate,
             weight_decay=self.config.train.weight_decay,
             betas=(0.9, 0.98),
             eps=1e-9
@@ -376,12 +377,59 @@ if __name__ == "__main__":
         n_rays=config.train.num_rays,
         val_chunk_size=config.eval.chunk 
     )
+    last_ckpt = None
+    if os.path.exists(checkpoint_dir):
+        ckpts = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
+        if ckpts:
+            # 找到最新的 checkpoint
+            last_ckpt = max(ckpts, key=os.path.getmtime)
+            print(f"🔄 检测到断点文件: {last_ckpt}")
+    if last_ckpt is None:
+        # ==========================================
+        # [新增] 阶段 1: 学习率搜索 (LR Finder)
+        # ==========================================
+        print(">>> 正在进行学习率搜索 (LR Finder)...")
+        
+        # 1. 创建一个临时的 Trainer (必须是单卡，不能用 DDP)
+        # 如果你想指定只用第一张卡跑搜索，设 devices=[0]
+        tuner_trainer = L.Trainer(
+            accelerator="gpu",
+            devices=[0],      # 搜索只需一张卡
+            strategy="auto",  # 必须是 auto，不能是 ddp
+            enable_checkpointing=False,
+            logger=False,     # 关掉日志，保持清爽
+            max_epochs=1      # 只是为了初始化，实际 Tuner 会控制步数
+        )
 
-    # 3. 创建 Trainer，配置 Logger 和 Checkpoint 路径
+        # 2. 初始化 Tuner
+        from lightning.pytorch.tuner import Tuner
+        tuner = Tuner(tuner_trainer)
+
+        # 3. 开始搜索 (会自动更新 model.learning_rate)
+        # min_lr 和 max_lr 可以根据你的经验调整范围
+        lr_finder = tuner.lr_find(model, datamodule=dm, min_lr=1e-6, max_lr=1e-3, num_training=100)
+
+        # 4. 获取结果并可视化
+        new_lr = lr_finder.suggestion()
+        print(f"✅ 建议的最佳学习率: {new_lr}")
+        
+        fig = lr_finder.plot(suggest=True)
+        fig.savefig(os.path.join(result_save_dir, "lr_finder_plot.png"))
+        print(f"📊 学习率曲线已保存至: {os.path.join(result_save_dir, 'lr_finder_plot.png')}")
+    # 6. 清理显存 
+        # 6. 清理显存 
+        del tuner_trainer, tuner
+        torch.cuda.empty_cache()
+    else :
+        print(">>> 跳过学习率搜索，直接进入正式训练...")
+    # ==========================================
+    # 阶段 2: 正式训练 (DDP)
+    # ==========================================
+    # 3. 创建正式的 Trainer 
     trainer = L.Trainer(
         max_steps=config.train.max_steps,
         accelerator="gpu",
-        devices=2,  
+        devices=1,  
         strategy="ddp",
         logger=TensorBoardLogger("logs", name=exp_name, version=mode), 
         callbacks=[
@@ -390,24 +438,17 @@ if __name__ == "__main__":
                 filename="lfnr-{epoch:02d}",
                 monitor="epoch",
                 mode="max",
+                save_last=True,
                 save_top_k=4,
-                every_n_epochs=5,
+                every_n_epochs=1,
                 save_on_train_epoch_end=True
             ),
+            # 这里会记录实际使用的 LR，你可以看到它是否变成了新值
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
         log_every_n_steps=50,
         check_val_every_n_epoch=10, 
     )
-
-    # 断点重训逻辑使用新路径
-    last_ckpt = None
-    if os.path.exists(checkpoint_dir):
-        ckpts = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
-        if ckpts:
-            last_ckpt = max(ckpts, key=os.path.getmtime)
-            print(f"检测到断点文件: {last_ckpt}")
-
     # 开始训练
     trainer.fit(model, dm, ckpt_path=last_ckpt)
     

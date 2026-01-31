@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
 import argparse
 import h5py
@@ -15,14 +16,11 @@ class LFModule(L.LightningModule):
     def __init__(self, config=None, n_rays=4096, save_dir="inference_results", use_roi=False):
         super().__init__()
         # 如果是从 checkpoint 加载，config 会由 lightning 自动恢复到 self.hparams 中
-        self.save_hyperparameters(config)
         self.config = config
         self.n_rays = n_rays
         self.save_dir = save_dir
         self.use_roi = use_roi # 新增
         
-        # 初始化模型
-        self.model = LFNR(config=config)
         
         # 指标初始化
         metrics_kwargs = {"data_range": 1.0}
@@ -31,10 +29,33 @@ class LFModule(L.LightningModule):
         self.test_step_outputs = []
 
     def forward(self, batch):
-        return self.model.forward(batch)
+        ref_images = batch['occ_rgb']  # [B, N, 3, H, W]
+        sampling_grid = batch['sampling_grid'] # [B, N, n_rays, 2]
+        B, N, C, H, W = ref_images.shape
+        ref_images_flat = ref_images.reshape(B * N, C, H, W)
+        grid_flat = sampling_grid.reshape(B * N, -1, 1, 2)
+
+        # 1. 采样原始 RGB
+        projected_rgb = F.grid_sample(ref_images_flat, grid_flat, align_corners=True, mode='bilinear')
+        projected_rgb = projected_rgb.squeeze(-1).permute(0, 2, 1) # [B*N, n_rays, 3]
+
+        # 还原形状为 [B, N, n_rays, 3]
+        projected_rgb = projected_rgb.view(B, N, -1, 3)
+
+        # 调整为 [B, n_rays, N, 3] 以便后续处理
+        projected_rgb = projected_rgb.permute(0, 2, 1, 3)  # [B, n_rays, N, 3]
+
+        # Overlay: 平均排除黑色像素 (sum(rgb) > epsilon)
+        valid_mask = (projected_rgb.sum(dim=-1, keepdim=True) > 1e-4).float()  # [B, n_rays, N, 1]
+        sum_rgb = (projected_rgb * valid_mask).sum(dim=2)  # [B, n_rays, 3]
+        count = valid_mask.sum(dim=2)  # [B, n_rays, 1]
+
+        # 避免除以0
+        projected_rgb = sum_rgb / (count.clamp(min=1.0))  # [B, n_rays, 3]
+        return projected_rgb
 
     def test_step(self, batch, batch_idx):
-        pred_chunk, _ = self(batch)
+        pred_chunk = self(batch)
         output = {
             'pred': pred_chunk.detach(),
             'gt': batch['gt_rgb'].detach(),
@@ -183,22 +204,26 @@ class LFModule(L.LightningModule):
 
 def main():
     parser = argparse.ArgumentParser(description="LFNR Inference Script")
-    parser.add_argument("--ckpt", type=str,default="checkpoints/base_LF/rot_arc/lfnr-epoch=174.ckpt", help="Path to the checkpoint (.ckpt) file")
     parser.add_argument("--data_dir", type=str, default="data", help="Root directory of the dataset") #
-    parser.add_argument("--save_dir", type=str, default="inference/base_LF", help="Directory to save the predicted images")
-    parser.add_argument("--mode", type=str, default="rot_arc", help="Data mode: fix_line, rot_arc, etc.")
-    parser.add_argument("--devices", type=int, default=2, help="Number of GPUs to use")
+    parser.add_argument("--save_dir", type=str, default="inference/overlap", help="Directory to save the predicted images")
+    parser.add_argument("--mode", type=str, default="fix_line", help="Data mode: fix_line, rot_arc, etc.")
+    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--use_roi", action="store_true", help="Calculate metrics only on non-background ROI") # 新增
     args = parser.parse_args()
 
-    print(f"=== 开始推理 | Checkpoint: {args.ckpt} | Mode: {args.mode} ===")
 
     # 1. 加载配置
     config = get_config()
     
-    # 2. 初始化模型
-    print(f"正在从 {args.ckpt} 加载模型...")
-    model = LFModule.load_from_checkpoint(checkpoint_path=args.ckpt)
+
+    model = LFModule(
+        config=config, 
+        n_rays=config.train.num_rays,
+        save_dir=args.save_dir,
+        use_roi=args.use_roi
+    )
+    
+     # 2. 设置保存目录
     model.save_dir = os.path.join(args.save_dir, args.mode)
 
     # 3. 初始化数据模块

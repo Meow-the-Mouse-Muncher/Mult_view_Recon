@@ -237,8 +237,8 @@ class LFDataModule(L.LightningDataModule):
             shuffled_files = train_val_files.copy()
             random.Random(42).shuffle(shuffled_files)
             
-            # 划分：前 99% 为 train，后 1% 为 val
-            train_size = int(0.99 * len(shuffled_files))
+            # 划分：前 95% 为 train，后 5% 为 val
+            train_size = int(0.95 * len(shuffled_files))
             self.train_dataset = LFDataset(shuffled_files[:train_size], split='train', n_rays=self.n_rays)
             self.val_dataset = LFDataset(shuffled_files[train_size:], split='val', n_rays=self.n_rays, val_chunk_size=self.val_chunk_size)
         elif stage == 'test':

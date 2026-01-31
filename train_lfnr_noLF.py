@@ -3,22 +3,18 @@ import time
 import torch
 import lightning as L
 from torch import nn
-from models.lfnr_DA import LFNR
-from dataset.LF_DA_dataset import LFDataModule
-from configs.config_DA import get_config
+from models.lfnr import LFNR
+from dataset.LF_dataset import LFDataModule
+from configs.config import get_config
 from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import h5py 
 from torchvision.utils import save_image
-import matplotlib
-matplotlib.use('Agg') # 强制使用非交互式后端，防止服务器报错
-import matplotlib.pyplot as plt
-import numpy as np
 
 torch.set_float32_matmul_precision('high')
 
 class LFModule(L.LightningModule):
-    """Lightning 模型包装器，用于训练 LFNR（动态最近K相机版本）。"""
+    """Lightning 模型包装器，用于训练 LFNR。"""
     def __init__(self, config, n_rays=4096, save_dir="pred_data"):
         super().__init__()
         self.save_hyperparameters(config)
@@ -41,11 +37,6 @@ class LFModule(L.LightningModule):
         self.val_step_outputs = []
         self.test_step_outputs = []
 
-        # [新增] 相机索引累积直方图
-        self.num_cams = config.model.cnn.get('num_train_views', 32)
-        # 注册为 buffer，但不保存到 checkpoint (persistent=False)，以免不同次运行冲突
-        self.register_buffer("cam_usage_hist", torch.zeros(self.num_cams), persistent=False)
-
     def forward(self, batch):
         return self.model.forward(batch)
 
@@ -56,79 +47,12 @@ class LFModule(L.LightningModule):
         loss_pred = self.mse_loss(pred_rgb, gt_rgb)
         loss_overlap = self.mse_loss(rgb_overlap, gt_rgb)
         loss = loss_pred + loss_overlap
-
-        # [新增] 统计并更新相机使用频率直方图
-        if 'nearest_cam_indices' in batch:
-            with torch.no_grad():
-                # 展平 indices: [B, n_rays, K] -> [-1]
-                indices = batch['nearest_cam_indices'].view(-1)
-                # 过滤有效索引 (防止意外越界)
-                valid_mask = (indices >= 0) & (indices < self.num_cams)
-                # 计算当前 batch 的频次
-                batch_counts = torch.bincount(indices[valid_mask], minlength=self.num_cams).float()
-                self.cam_usage_hist += batch_counts
-
-                # 遵循 Trainer 的 log_every_n_steps 设置进行记录
-                # 注意：self.log 自动处理频率，但 add_image 需要手动判断步数
-                # 我们可以利用 self.global_step 和 trainer.log_every_n_steps
-                if self.global_step % self.trainer.log_every_n_steps == 0:
-                     self._log_cam_usage_histogram()
         
         self.log('train/loss', loss, prog_bar=True, sync_dist=True)
         self.log('train/loss_pred', loss_pred, sync_dist=True)
         self.log('train/loss_overlap', loss_overlap, sync_dist=True)
             
         return loss
-
-    def _log_cam_usage_histogram(self):
-        """生成相机使用频率的 Bar Chart 并记录到 TensorBoard"""
-        # 1. 聚合多卡数据 (Sum)
-        if self.trainer.num_devices > 1 and self.trainer.strategy:
-             # all_gather 返回 [N_gpus, D], sum(dim=0) 得到全局累积
-            try:
-                global_hist = self.all_gather(self.cam_usage_hist).sum(dim=0)
-            except NotImplementedError:
-                 # 部分 strategy 不支持 all_gather，降级使用本地
-                global_hist = self.cam_usage_hist
-        else:
-            global_hist = self.cam_usage_hist
-
-        # 2. 仅 Rank 0 绘图
-        if self.global_rank == 0:
-            try:
-                # 创建 Matplotlib Figure
-                # 使用 Agg 后端创建，避免 GUI 显示..
-                fig, ax = plt.subplots(figsize=(8, 4), dpi=100)
-                x = np.arange(len(global_hist))
-                y = global_hist.cpu().numpy()
-                
-                ax.bar(x, y, color='skyblue', alpha=0.7)
-                ax.set_title(f"Cumulative Camera Usage (Step {self.global_step})")
-                ax.set_xlabel("Camera Index")
-                ax.set_ylabel("Selection Count")
-                ax.grid(axis='y', linestyle='--', alpha=0.5)
-                
-                # 转换 Figure 为 Tensor
-                fig.canvas.draw()
-                
-                # 获取图像数据 (修复：使用 buffer_rgba 替代已弃用的 tostring_rgb)
-                w, h = fig.canvas.get_width_height()
-                buf = fig.canvas.buffer_rgba() # 返回 RGBA 字节流
-                
-                data = np.frombuffer(buf, dtype=np.uint8)
-                data = data.reshape((h, w, 4)) # RGBA
-                data = data[:, :, :3] # 丢弃 Alpha 通道，保留 RGB [H, W, 3]
-                
-                # [H, W, 3] -> [3, H, W]
-                img_tensor = torch.from_numpy(data.copy()).permute(2, 0, 1) # copy 避免内存警告
-                
-                # Log Image
-                if hasattr(self.logger, 'experiment'):
-                    self.logger.experiment.add_image('train/cam_usage_hist', img_tensor, self.global_step)
-                
-                plt.close(fig) # 必须关闭，否则内存泄漏
-            except Exception as e:
-                print(f"[Hist Warning] Failed to log histogram: {e}")
 
     # === DDP 兼容的验证逻辑 ===
     
@@ -397,15 +321,32 @@ class LFModule(L.LightningModule):
             },
         }
 
+    # def on_after_backward(self):
+    #     # 仅在训练的第一步运行一次检查
+    #     if self.global_step == 0:
+    #         print("\n" + "="*50)
+    #         print("正在检测未使用的模型参数 (grad is None):")
+    #         unused_params = []
+    #         for name, param in self.named_parameters():
+    #             if param.grad is None:
+    #                 unused_params.append(name)
+    #                 print(f"🚩 未使用的参数: {name}")
+            
+    #         if not unused_params:
+    #             print("✅ 完美！所有参数都参与了梯度计算。")
+    #         else:
+    #             print(f"\n共发现 {len(unused_params)} 个未使用的参数。")
+    #         print("="*50 + "\n")
+
 if __name__ == "__main__":
     import argparse
     start_time = time.time()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_name", type=str, default="DA", help="消融实验名称")
+    parser.add_argument("--exp_name", type=str, default="noLF", help="消融实验名称")
     parser.add_argument("--mode", type=str, default="rot_arc", help="数据模式: fix_line, rot_arc, rot_line, mix")
     args, _ = parser.parse_known_args()
 
-    print(f"=== 开始训练 LFNR-DA 模型（动态最近K相机）| 实验: {args.exp_name} | 模式: {args.mode} ===")
+    print(f"=== 开始训练 LFNR 模型 | 实验: {args.exp_name} | 模式: {args.mode} ===")
     
     # 1. 加载参数
     config = get_config()
@@ -433,25 +374,23 @@ if __name__ == "__main__":
         batch_size=1,
         num_workers=4,
         n_rays=config.train.num_rays,
-        val_chunk_size=config.eval.chunk,
-        max_k_cams=config.dataset.max_k_cams,
-        cone_angle=config.dataset.cone_angle
+        val_chunk_size=config.eval.chunk 
     )
 
     # 3. 创建 Trainer，配置 Logger 和 Checkpoint 路径
-    devices = 2
     trainer = L.Trainer(
         max_steps=config.train.max_steps,
         accelerator="gpu",
-        devices=devices,  
-        strategy="ddp" if devices > 1 else "auto",
+        devices=2,  
+        strategy="ddp",
         logger=TensorBoardLogger("logs", name=exp_name, version=mode), 
         callbacks=[
             L.pytorch.callbacks.ModelCheckpoint(
                 dirpath=checkpoint_dir,
-                filename="lfnr-da-{epoch:02d}",
+                filename="lfnr-{epoch:02d}",
                 monitor="epoch",
                 mode="max",
+                save_last=True,  # 自动保存last.ckpt
                 save_top_k=4,
                 every_n_epochs=5,
                 save_on_train_epoch_end=True
@@ -459,7 +398,7 @@ if __name__ == "__main__":
             L.pytorch.callbacks.LearningRateMonitor(logging_interval="epoch")
         ],
         log_every_n_steps=50,
-        check_val_every_n_epoch=5, 
+        check_val_every_n_epoch=10, 
     )
 
     # 断点重训逻辑使用新路径
